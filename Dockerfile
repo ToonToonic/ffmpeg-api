@@ -1,10 +1,11 @@
 FROM python:3.11-slim
 
 # Устанавливаем FFmpeg и системные зависимости
-RUN apt-get update && apt-get install -y \\
-    ffmpeg \\
-    curl \\
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    curl \
     && rm -rf /var/lib/apt/lists/*
+
 
 WORKDIR /app
 
@@ -19,4 +20,5 @@ COPY . .
 EXPOSE $PORT
 
 # Запускаем приложение
+
 CMD gunicorn --bind 0.0.0.0:$PORT --timeout 300 --workers 1 app:app
