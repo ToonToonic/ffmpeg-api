@@ -6,7 +6,6 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-
 WORKDIR /app
 
 # Копируем и устанавливаем зависимости
@@ -22,3 +21,4 @@ EXPOSE $PORT
 # Запускаем приложение
 
 CMD gunicorn --bind 0.0.0.0:$PORT --timeout 300 --workers 1 app:app
+
