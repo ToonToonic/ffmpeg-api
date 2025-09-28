@@ -11,10 +11,10 @@ from botocore.exceptions import ClientError
 app = Flask(__name__)
 
 # Настройки для загрузки в R2 (замените на свои)
-R2_ACCOUNT_ID = os.environ.get('R2_ACCOUNT_ID')
-R2_ACCESS_KEY_ID = os.environ.get('R2_ACCESS_KEY_ID')
-R2_SECRET_ACCESS_KEY = os.environ.get('R2_SECRET_ACCESS_KEY')
-R2_BUCKET = os.environ.get('R2_BUCKET')
+R2_ACCOUNT_ID = os.environ.get('R2_6f1ac28ebf03130548e2107f0eb7fa7e')
+R2_ACCESS_KEY_ID = os.environ.get('R2_c09ebc367094139a68c1bd45be898a66')
+R2_SECRET_ACCESS_KEY = os.environ.get('R2_c941e8a74ee3e329a0fc4e46d955ef383c1946a9dcea91407d8b278bcf6d5879')
+R2_BUCKET = os.environ.get('R2_toontoonic-scenes')
 
 def download_file(url, filename):
     """Скачивает файл по URL"""
