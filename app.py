@@ -10,10 +10,11 @@ from botocore.exceptions import ClientError
 
 app = Flask(__name__)
 
-# Настройки для загрузки в S3 (замените на свои)
-AWS_ACCESS_KEY_ID = os.environ.get('AWS_ACCESS_KEY_ID')
-AWS_SECRET_ACCESS_KEY = os.environ.get('AWS_SECRET_ACCESS_KEY')
-S3_BUCKET = os.environ.get('S3_BUCKET')
+# Настройки для загрузки в R2 (замените на свои)
+R2_ACCOUNT_ID = os.environ.get('R2_ACCOUNT_ID')
+R2_ACCESS_KEY_ID = os.environ.get('R2_ACCESS_KEY_ID')
+R2_SECRET_ACCESS_KEY = os.environ.get('R2_SECRET_ACCESS_KEY')
+R2_BUCKET = os.environ.get('R2_BUCKET')
 
 def download_file(url, filename):
     """Скачивает файл по URL"""
@@ -29,22 +30,25 @@ def download_file(url, filename):
         print(f"Ошибка скачивания {url}: {e}")
         return False
 
-def upload_to_s3(file_path, object_name=None):
-    """Загружает файл в S3"""
+def upload_to_r2(file_path, object_name=None):
     if object_name is None:
         object_name = os.path.basename(file_path)
-    
+   
+    endpoint_url = f'https://6f1ac28ebf03130548e2107f0eb7fa7e.r2.cloudflarestorage.com'
+   
     s3_client = boto3.client(
         's3',
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY
+        endpoint_url=endpoint_url,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        region_name='auto'
     )
-    
+   
     try:
-        s3_client.upload_file(file_path, S3_BUCKET, object_name)
-        return f"https://{S3_BUCKET}.s3.amazonaws.com/{object_name}"
-    except ClientError as e:
-        print(f"Ошибка загрузки в S3: {e}")
+        s3_client.upload_file(file_path, R2_BUCKET, toontoonic-scenes)
+        return f"https://pub-your-hash.r2.dev/toontoonic-scenes"
+    except Exception as e:
+        print(f"R2 upload error: {e}")
         return None
 
 @app.route('/merge-videos', methods=['POST'])
@@ -89,11 +93,11 @@ def merge_videos():
             if not final_video:
                 return jsonify({'error': 'Video merging failed'}), 500
             
-            # Загружаем результат в S3
+            # Загружаем результат в R2
             unique_id = str(uuid.uuid4())
-            s3_object_name = f"videos/{unique_id}.mp4"
+            r2_object_name = f"videos/{unique_id}.mp4"
             
-            result_url = upload_to_s3(final_video, s3_object_name)
+            result_url = upload_to_r2(final_video, r2_toontoonic-scenes)
             
             if result_url:
                 return jsonify({
@@ -201,3 +205,4 @@ def test_endpoint():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
     app.run(host='0.0.0.0', port=port, debug=False)
+"Update for Cloudflare R2"
