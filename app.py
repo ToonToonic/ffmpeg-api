@@ -8,10 +8,15 @@ from werkzeug.utils import secure_filename
 import boto3
 from botocore.exceptions import ClientError
 app = Flask(__name__)
-# Настройки для загрузки в S3 (замените на свои)
-AWS_ACCESS_KEY_ID = os.environ.get('AWS_ACCESS_KEY_ID')
-AWS_SECRET_ACCESS_KEY = os.environ.get('AWS_SECRET_ACCESS_KEY')
-S3_BUCKET = os.environ.get('S3_BUCKET')
+# Настройки для загрузки в R2
+R2_ACCOUNT_ID = os.environ.get('R2_ACCOUNT_ID')
+R2_ACCESS_KEY_ID = os.environ.get('R2_ACCESS_KEY_ID')
+R2_SECRET_ACCESS_KEY = os.environ.get('R2_SECRET_ACCESS_KEY')
+R2_BUCKET = os.environ.get('R2_BUCKET')
+
+R2_PUBLIC_DOMAIN = os.environ.get('R2_PUBLIC_DOMAIN', 'https://pub-bd37e3cfae574077ab0d4461a749b0d3.r2.dev') 
+# Настрой в Variables
+
 def download_file(url, filename):
     """Скачивает файл по URL"""
     try:
@@ -26,22 +31,37 @@ def download_file(url, filename):
         print(f"Ошибка скачивания {url}: {e}")
         return False
 def upload_to_s3(file_path, object_name=None):
-    """Загружает файл в S3"""
+    """Загружает файл в Cloudflare R2"""
     if object_name is None:
         object_name = os.path.basename(file_path)
    
+    if not all([R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET]):
+        logger.error("R2 credentials not configured")
+        return None
+   
+    endpoint_url = f'https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com'
+   
     s3_client = boto3.client(
         's3',
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY
+        endpoint_url=endpoint_url,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        region_name='auto'
     )
    
     try:
-        s3_client.upload_file(file_path, S3_BUCKET, object_name)
-        return f"https://{S3_BUCKET}.s3.amazonaws.com/{object_name}"
+        logger.info(f"Uploading {file_path} to {R2_BUCKET}/{object_name}")
+        s3_client.upload_file(file_path, R2_BUCKET, object_name)
+        public_url = f"https://{R2_PUBLIC_DOMAIN}/{object_name}"
+        logger.info(f"Uploaded successfully: {public_url}")
+        return public_url
     except ClientError as e:
-        print(f"Ошибка загрузки в S3: {e}")
+        logger.error(f"R2 upload error: {e.response['Error']}")
         return None
+    except Exception as e:
+        logger.error(f"Unexpected R2 error: {e}")
+        return None
+
 @app.route('/merge-videos', methods=['POST'])
 def merge_videos():
     """Основной эндпоинт для склейки видео"""
@@ -84,11 +104,11 @@ def merge_videos():
             if not final_video:
                 return jsonify({'error': 'Video merging failed'}), 500
            
-            # Загружаем результат в S3
+            # Загружаем результат в R2
             unique_id = str(uuid.uuid4())
-            s3_object_name = f"videos/{unique_id}.mp4"
+            r2_object_name = f"videos/{unique_id}.mp4"
            
-            result_url = upload_to_s3(final_video, s3_object_name)
+            result_url = upload_to_r2(final_video, r2_object_name)
            
             if result_url:
                 return jsonify({
