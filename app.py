@@ -96,7 +96,7 @@ def merge_videos():
                 })
             else:
                 return jsonify({'error': 'Upload failed'}), 500
-               
+    "Add debug version of merge_videos"           
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 def merge_video_files(video_files, audio_files, background_music, temp_dir):
