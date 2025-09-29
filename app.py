@@ -64,24 +64,46 @@ def upload_to_s3(file_path, object_name=None):
 
 @app.route('/merge-videos', methods=['POST'])
 def merge_videos():
-    """Тестовая версия для отладки"""
+    """Основной эндпоинт для склейки видео"""
+   
     try:
         data = request.json
-        print(f"Received data: {data}")
-        print(f"Data type: {type(data)}")
-        
         scenes = data.get('scenes', [])
-        print(f"Scenes count: {len(scenes)}")
-        
-        return jsonify({
-            "success": True, 
-            "message": "Test response - API working",
-            "received_scenes": len(scenes)
-        })
-    except Exception as e:
-        print(f"Error in merge_videos: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+        background_music = data.get('background_music_url')
+       
+        if not scenes:
+            return jsonify({'error': 'No scenes provided'}), 400
+       
+        # Создаем временную директорию
+        with tempfile.TemporaryDirectory() as temp_dir:
+            video_files = []
+            audio_files = []
            
+            # Скачиваем все файлы
+            for i, scene in enumerate(scenes):
+                video_url = scene.get('video_url')
+                audio_url = scene.get('audio_url')
+                duration = scene.get('duration', 8)
+               
+                if video_url:
+                    video_path = os.path.join(temp_dir, f"video_{i}.mp4")
+                    if download_file(video_url, video_path):
+                        video_files.append((video_path, duration))
+               
+                if audio_url:
+                    audio_path = os.path.join(temp_dir, f"audio_{i}.wav")
+                    if download_file(audio_url, audio_path):
+                        audio_files.append((audio_path, duration))
+           
+            if not video_files:
+                return jsonify({'error': 'No valid video files found'}), 400
+           
+            # Склеиваем видео
+            final_video = merge_video_files(video_files, audio_files, background_music, temp_dir)
+           
+            if not final_video:
+                return jsonify({'error': 'Video merging failed'}), 500
+            
             # Загружаем результат в R2
             unique_id = str(uuid.uuid4())
             r2_object_name = f"videos/{unique_id}.mp4"
