@@ -70,7 +70,7 @@ def upload_to_r2(file_path, object_name=None):
     try:
         logger.info(f"Uploading {file_path} to {R2_BUCKET}/{object_name}")
         s3_client.upload_file(file_path, R2_BUCKET, object_name)
-        public_url = f"https://{R2_PUBLIC_DOMAIN}/{object_name}"
+        public_url = f"{R2_PUBLIC_DOMAIN}/{object_name}"
         logger.info(f"Uploaded to {public_url}")
         return public_url
     except ClientError as e:
