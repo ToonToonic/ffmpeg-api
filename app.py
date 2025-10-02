@@ -140,18 +140,22 @@ def merge_video_files(video_files, audio_files, background_music, temp_dir):
         concat_file = os.path.join(temp_dir, 'concat_list.txt')
         with open(concat_file, 'w') as f:
             for video_path, duration in video_files:
-                f.write(f"file '{video_path}'\n")
-                f.write(f"duration {duration}\n")
+                f.write(f"file '{video_path}'
+")
+                f.write(f"duration {duration}
+")
         output_file = os.path.join(temp_dir, 'final_video.mp4')
         cmd = [
             'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat_file,
-            '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', output_file
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+            '-c:a', 'aac', '-b:a', '128k', output_file
         ]
         if audio_files:
             audio_concat_file = os.path.join(temp_dir, 'audio_concat.txt')
             with open(audio_concat_file, 'w') as f:
                 for audio_path, _ in audio_files:
-                    f.write(f"file '{audio_path}'\n")
+                    f.write(f"file '{audio_path}'
+")
             merged_audio = os.path.join(temp_dir, 'merged_audio.wav')
             audio_cmd = [
                 'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', audio_concat_file,
@@ -163,11 +167,14 @@ def merge_video_files(video_files, audio_files, background_music, temp_dir):
                 return None
             cmd = [
                 'ffmpeg', '-y', '-i', output_file, '-i', merged_audio,
-                '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', '-shortest',
+                '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+                '-c:a', 'aac', '-b:a', '128k', '-shortest',
                 f"{output_file}_final.mp4"
             ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             output_file = f"{output_file}_final.mp4"
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        else:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if result.returncode == 0 and os.path.exists(output_file):
             logger.info(f"Merged to {output_file}")
             return output_file
