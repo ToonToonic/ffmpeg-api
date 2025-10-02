@@ -140,10 +140,8 @@ def merge_video_files(video_files, audio_files, background_music, temp_dir):
         concat_file = os.path.join(temp_dir, 'concat_list.txt')
         with open(concat_file, 'w') as f:
             for video_path, duration in video_files:
-                f.write(f"file '{video_path}'
-")
-                f.write(f"duration {duration}
-")
+                 f.write(f"file '{video_path}'\n")
+                f.write(f"duration {duration}\n")
         output_file = os.path.join(temp_dir, 'final_video.mp4')
         cmd = [
             'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat_file,
