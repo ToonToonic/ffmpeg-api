@@ -4,3 +4,4 @@ boto3==1.28.57
 werkzeug==2.3.7
 gunicorn==21.2.0
 ffmpeg-python==0.2.0
+moviepy==1.0.3
