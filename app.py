@@ -31,7 +31,7 @@ def render_video():
         audio_url = scene["audio_url"]
 
         video_path = f"{TEMP_DIR}/video_{i}.mp4"
-        audio_path = f"{TEMP_DIR}/audio_{i}.mp3"
+        audio_path = f"{TEMP_DIR}/audio_{i}.wav"
         output_path = f"{TEMP_DIR}/clip_{i}.mp4"
 
         # Скачать файлы
