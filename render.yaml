@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: toontoonic-api
+    env: python
+    region: frankfurt
+    buildCommand: |
+      apt-get update && apt-get install -y ffmpeg
+      pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:8080
+    plan: free
+    envVars:
+      - key: R2_ACCESS_KEY
+        sync: false
+      - key: R2_SECRET_KEY
+        sync: false
+      - key: R2_BUCKET
+        sync: false
+      - key: R2_ENDPOINT
+        sync: false
+      - key: R2_PUBLIC_URL
+        sync: false
