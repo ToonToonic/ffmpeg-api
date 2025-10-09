@@ -13,7 +13,7 @@ R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
 R2_BUCKET = os.getenv("R2_BUCKET")
 R2_ENDPOINT = os.getenv("R2_ENDPOINT")
-R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL")  # Добавь в Render
+R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL")  # Убедись, что добавлен в Render
 
 # Папка для временных файлов
 TEMP_DIR = "temp"
@@ -56,22 +56,18 @@ def render_video():
             clips.append(output_path)
 
         # 2. Объединяем все клипы с плавными переходами
-try:
-    concat_file = f"{TEMP_DIR}/concat.txt"
-    with open(concat_file, "w") as f:
-        for c in clips:
-            f.write(f"file '{os.path.abspath(c)}'\n")
+        concat_file = f"{TEMP_DIR}/concat.txt"
+        with open(concat_file, "w") as f:
+            for c in clips:
+                f.write(f"file '{os.path.abspath(c)}'\n")
 
-    merged_path = f"{TEMP_DIR}/merged.mp4"
-    subprocess.run([
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-        "-i", concat_file,
-        "-filter_complex", "xfade=transition=fade:duration=1:offset=5",
-        "-c:v", "libx264", "-c:a", "aac", merged_path
-    ])
-
-except Exception as e:
-    print(f"[ERROR] Failed to merge videos: {e}")
+        merged_path = f"{TEMP_DIR}/merged.mp4"
+        subprocess.run([
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", concat_file,
+            "-filter_complex", "xfade=transition=fade:duration=1:offset=5",
+            "-c:v", "libx264", "-c:a", "aac", merged_path
+        ])
 
         # 3. Добавляем фоновую музыку
         final_path = f"{TEMP_DIR}/final_{uuid.uuid4().hex}.mp4"
@@ -105,11 +101,9 @@ except Exception as e:
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
-
 @app.route('/', methods=['GET'])
 def home():
     return "FFmpeg API is running 🚀"
-
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
