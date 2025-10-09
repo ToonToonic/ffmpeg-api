@@ -56,23 +56,22 @@ def render_video():
             clips.append(output_path)
 
         # 2. Объединяем все клипы с плавными переходами
-concat_file = f"{TEMP_DIR}/concat.txt"
-with open(concat_file, "w") as f:
-    for c in clips:
-        f.write(f"file '{os.path.abspath(c)}'\n")
+try:
+    concat_file = f"{TEMP_DIR}/concat.txt"
+    with open(concat_file, "w") as f:
+        for c in clips:
+            f.write(f"file '{os.path.abspath(c)}'\n")
 
-merged_path = f"{TEMP_DIR}/merged.mp4"
+    merged_path = f"{TEMP_DIR}/merged.mp4"
+    subprocess.run([
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", concat_file,
+        "-filter_complex", "xfade=transition=fade:duration=1:offset=5",
+        "-c:v", "libx264", "-c:a", "aac", merged_path
+    ])
 
-# Плавные переходы (fade) между клипами
-# duration=1 — длительность перехода (1 сек)
-# offset автоматически вычисляется
-subprocess.run([
-    "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-    "-i", concat_file,
-    "-filter_complex", "xfade=transition=fade:duration=1:offset=5",
-    "-c:v", "libx264", "-c:a", "aac", merged_path
-])
-
+except Exception as e:
+    print(f"[ERROR] Failed to merge videos: {e}")
 
         # 3. Добавляем фоновую музыку
         final_path = f"{TEMP_DIR}/final_{uuid.uuid4().hex}.mp4"
