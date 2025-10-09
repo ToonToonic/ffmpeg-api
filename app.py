@@ -38,6 +38,12 @@ def render_video():
             audio_path = f"{TEMP_DIR}/audio_{i}.wav"
             output_path = f"{TEMP_DIR}/clip_{i}.mp4"
 
+            # Проверяем доступность видео и аудио перед скачиванием
+            for url in [video_url, audio_url]:
+                head = requests.head(url)
+                if head.status_code != 200:
+                    raise Exception(f"URL not accessible: {url}")
+
             # Скачать файлы
             for url, path in [(video_url, video_path), (audio_url, audio_path)]:
                 r = requests.get(url)
@@ -56,7 +62,7 @@ def render_video():
 
             clips.append(output_path)
 
-        # 2️⃣ Объединяем все клипы с плавными переходами (1 секунда)
+        # 2️⃣ Объединяем все клипы через concat
         concat_file = f"{TEMP_DIR}/concat.txt"
         with open(concat_file, "w") as f:
             for c in clips:
@@ -64,14 +70,6 @@ def render_video():
 
         merged_path = f"{TEMP_DIR}/merged.mp4"
 
-        # Создаём плавные переходы между сценами
-        filter_complex = ""
-        for i in range(len(clips)):
-            filter_complex += f"[{i}:v][{i}:a]"
-        filter_complex = "".join([f"[{i}:v][{i}:a]" for i in range(len(clips))])
-        
-        # Простое объединение через concat с плавными переходами
-        # xfade применим позже (иначе Render может зависнуть)
         subprocess.run([
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
             "-i", concat_file,
@@ -87,27 +85,53 @@ def render_video():
         )
         total_duration = float(result.stdout.strip())
 
-        # 4️⃣ Повторяем фоновую музыку до конца видео + делаем fade in/out
+        # 4️⃣ Повторяем фоновую музыку до длины видео + fade in/out
         bg_extended = f"{TEMP_DIR}/bg_extended.mp3"
         subprocess.run([
             "ffmpeg", "-y",
-            "-stream_loop", "-1",  # повторять бесконечно
+            "-stream_loop", "-1",
             "-i", bg_music,
-            "-t", str(total_duration),  # длительность = длина видео
-            "-af", "afade=t=in:ss=0:d=3,afade=t=out:st=" + str(total_duration - 3) + ":d=3",
+            "-t", str(total_duration),
+            "-af", f"afade=t=in:ss=0:d=3,afade=t=out:st={total_duration - 3}:d=3",
             bg_extended
         ], check=True)
 
-        # 5️⃣ Накладываем фоновую музыку с громкостью 0.2
+        # 5️⃣ Проверяем, есть ли аудио в merged.mp4
+        probe = subprocess.run([
+            "ffprobe", "-v", "error",
+            "-select_streams", "a",
+            "-show_entries", "stream=index",
+            "-of", "csv=p=0",
+            merged_path
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        has_audio = bool(probe.stdout.strip())
+
         final_path = f"{TEMP_DIR}/final_{uuid.uuid4().hex}.mp4"
-        subprocess.run([
-            "ffmpeg", "-y",
-            "-i", merged_path,
-            "-i", bg_extended,
-            "-filter_complex", "[1:a]volume=0.2[a1];[0:a][a1]amix=inputs=2:duration=longest",
-            "-c:v", "copy",
-            "-shortest", final_path
-        ], check=True)
+
+        if has_audio:
+            # Микшируем фоновую музыку с аудио из видео
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-i", merged_path,
+                "-i", bg_extended,
+                "-filter_complex", "[1:a]volume=0.2[a1];[0:a][a1]amix=inputs=2:duration=longest",
+                "-c:v", "copy",
+                "-shortest", final_path
+            ], check=True)
+        else:
+            # В merged.mp4 нет аудио — просто добавляем фоновую музыку
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-i", merged_path,
+                "-i", bg_extended,
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-shortest",
+                final_path
+            ], check=True)
 
         # 6️⃣ Загружаем в Cloudflare R2
         s3 = boto3.client(
@@ -133,12 +157,3 @@ def render_video():
     except Exception as e:
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@app.route('/', methods=['GET'])
-def home():
-    return "🎬 FFmpeg API is running smoothly 🚀"
-
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080)
