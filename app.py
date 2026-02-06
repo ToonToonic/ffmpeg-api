@@ -1,50 +1,9 @@
-from flask import Flask, jsonify
-import os
-
-app = Flask(__name__)
-
-@app.route('/', methods=['GET'])
-def health_check():
-    return jsonify({"status": "ok", "message": "Server is running"})
-
-@app.route('/test', methods=['GET'])
-def test():
-    return jsonify({
-        "status": "ok",
-        "env_vars": {
-            "R2_BUCKET": os.getenv("R2_BUCKET", "NOT SET"),
-            "R2_ENDPOINT": os.getenv("R2_ENDPOINT", "NOT SET"),
-            "PORT": os.getenv("PORT", "NOT SET")
-        }
-    })
-
-if __name__ == '__main__':
-    port = int(os.getenv('PORT', 10000))
-    print(f"Starting server on port {port}")
-    app.run(host='0.0.0.0', port=port)
-```
-
-Загрузи ЭТОТ простой код на GitHub и задеплой. Если **это не работает**, значит проблема в конфигурации Render, а не в коде.
-
----
-
-## Если простой код работает, тогда проблема в основном коде
-
-Проверь эти моменты в твоём **полном app.py**:
-
-### ❌ Возможные проблемы:
-
-1. **Отступы (indentation)** - Python очень чувствителен к отступам
-2. **Импорты** - возможно какая-то библиотека не установлена
-3. **sys.exit(1)** в коде - это принудительно завершает приложение
-
-## ✅ Исправленный app.py БЕЗ sys.exit():
-
-```python
 from flask import Flask, request, jsonify
 import subprocess
 import os
+import boto3
 import uuid
+import requests
 import traceback
 
 app = Flask(__name__)
@@ -56,148 +15,103 @@ R2_BUCKET = os.getenv("R2_BUCKET")
 R2_ENDPOINT = os.getenv("R2_ENDPOINT")
 R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL")
 
-TEMP_DIR = "/tmp"
+# Папка для временных файлов
+TEMP_DIR = "temp"
 os.makedirs(TEMP_DIR, exist_ok=True)
-
-print("=== Server Starting ===")
-print(f"R2_BUCKET: {R2_BUCKET}")
-print(f"R2_ENDPOINT: {R2_ENDPOINT}")
-print("======================")
-
-@app.route('/', methods=['GET'])
-def health_check():
-    return jsonify({
-        "status": "ok",
-        "service": "toontoonic-api"
-    })
 
 @app.route('/render', methods=['POST'])
 def render_video():
-    try:
-        # Импортируем boto3 и requests только когда нужны
-        import boto3
-        import requests
-       
-        data = request.get_json()
-        if not data:
-            return jsonify({"status": "error", "message": "No JSON data"}), 400
-       
-        input_data = data.get("input", {})
-        video_cover_url = input_data.get("video_cover")
-        scenes = input_data.get("scenes", [])
-        bg_music_url = input_data.get("background_music_url")
-       
-        if not scenes or not bg_music_url:
-            return jsonify({
-                "status": "error",
-                "message": "Missing scenes or background_music_url"
-            }), 400
+    try:
+        data = request.get_json()
+        input_data = data.get("input", {})  # Фикс: берём из "input"
+        if not input_data:
+            raise Exception("No 'input' data in request")
 
-        clips = []
+        video_cover = input_data.get("video_cover")
+        scenes = input_data.get("scenes", [])
+        bg_music = input_data.get("background_music_url")
 
-        # Download function
-        def download(url, path):
-            print(f"Downloading: {url}")
-            r = requests.get(url, timeout=60)
-            r.raise_for_status()
-            with open(path, 'wb') as f:
-                f.write(r.content)
-            print(f"Downloaded: {path}")
+        if not scenes:
+            raise Exception("No scenes provided")
+        if not bg_music:
+            raise Exception("No background_music_url provided")
 
-        # Process cover
-        if video_cover_url:
-            cover_path = f"{TEMP_DIR}/cover.mp4"
-            download(video_cover_url, cover_path)
-            clips.append(cover_path)
+        clips = []
 
-        # Process scenes
-        for i, scene in enumerate(scenes):
-            video_url = scene.get("video_url")
-            audio_url = scene.get("audio_url")
-           
-            if not video_url or not audio_url:
-                continue
+        # 0️⃣ Обработка video_cover (вставляем в начало)
+        if video_cover:
+            # Проверяем доступность
+            head = requests.head(video_cover)
+            if head.status_code != 200:
+                raise Exception(f"Cover URL not accessible: {video_cover}")
 
-            video_path = f"{TEMP_DIR}/video_{i}.mp4"
-            audio_path = f"{TEMP_DIR}/audio_{i}.wav"
-            output_path = f"{TEMP_DIR}/clip_{i}.mp4"
+            cover_path = f"{TEMP_DIR}/cover.mp4"
+            r = requests.get(video_cover)
+            r.raise_for_status()
+            with open(cover_path, 'wb') as f:
+                f.write(r.content)
+            
+            clips.append(cover_path)  # Добавляем как первый клип (без аудио)
 
-            download(video_url, video_path)
-            download(audio_url, audio_path)
+        # 1️⃣ Скачиваем и объединяем каждую пару видео + аудио (как раньше)
+        for i, scene in enumerate(scenes):
+            video_url = scene["video_url"]
+            audio_url = scene["audio_url"]
 
-            subprocess.run([
-                "ffmpeg", "-y", "-i", video_path, "-i", audio_path,
-                "-c:v", "copy", "-c:a", "aac", "-shortest", output_path
-            ], check=True, capture_output=True)
+            # Проверяем доступность
+            for url in [video_url, audio_url]:
+                head = requests.head(url)
+                if head.status_code != 200:
+                    raise Exception(f"URL not accessible: {url}")
 
-            clips.append(output_path)
+            video_path = f"{TEMP_DIR}/video_{i}.mp4"
+            audio_path = f"{TEMP_DIR}/audio_{i}.wav"
+            output_path = f"{TEMP_DIR}/clip_{i}.mp4"
 
-        # Concat
-        concat_file = f"{TEMP_DIR}/concat.txt"
-        with open(concat_file, "w") as f:
-            for c in clips:
-                f.write(f"file '{c}'\n")
+            # Скачать файлы
+            for url, path in [(video_url, video_path), (audio_url, audio_path)]:
+                r = requests.get(url)
+                r.raise_for_status()
+                with open(path, 'wb') as f:
+                    f.write(r.content)
 
-        merged_path = f"{TEMP_DIR}/merged.mp4"
-        subprocess.run([
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", concat_file, "-c", "copy", merged_path
-        ], check=True, capture_output=True)
+            # Объединить видео и аудио
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-i", video_path,
+                "-i", audio_path,
+                "-c:v", "copy", "-c:a", "aac",
+                output_path
+            ], check=True)
 
-        # Get duration
-        result = subprocess.run([
-            "ffprobe", "-v", "error", "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1", merged_path
-        ], stdout=subprocess.PIPE, text=True, check=True)
-       
-        duration = float(result.stdout.strip())
+            clips.append(output_path)
 
-        # Background music
-        bg_path = f"{TEMP_DIR}/bg_music.mp3"
-        download(bg_music_url, bg_path)
+        # Проверяем bg_music
+        head = requests.head(bg_music)
+        if head.status_code != 200:
+            raise Exception(f"Background music URL not accessible: {bg_music}")
 
-        bg_extended = f"{TEMP_DIR}/bg_extended.mp3"
-        subprocess.run([
-            "ffmpeg", "-y", "-stream_loop", "-1", "-i", bg_path,
-            "-t", str(duration),
-            "-af", f"afade=t=in:ss=0:d=3,afade=t=out:st={max(0,duration-3)}:d=3",
-            bg_extended
-        ], check=True, capture_output=True)
+        # 2️⃣ Объединяем все клипы через concat (как раньше)
+        concat_file = f"{TEMP_DIR}/concat.txt"
+        with open(concat_file, "w") as f:
+            for c in clips:
+                f.write(f"file '{os.path.abspath(c)}'\n")
 
-        # Final mix
-        final_path = f"{TEMP_DIR}/final_{uuid.uuid4().hex}.mp4"
-        subprocess.run([
-            "ffmpeg", "-y", "-i", merged_path, "-i", bg_extended,
-            "-filter_complex", "[1:a]volume=0.2[a1];[0:a][a1]amix=inputs=2:duration=first",
-            "-c:v", "copy", "-c:a", "aac", final_path
-        ], check=True, capture_output=True)
+        merged_path = f"{TEMP_DIR}/merged.mp4"
 
-        # Upload to R2
-        s3 = boto3.client(
-            's3',
-            endpoint_url=R2_ENDPOINT,
-            aws_access_key_id=R2_ACCESS_KEY,
-            aws_secret_access_key=R2_SECRET_KEY
-        )
+        subprocess.run([
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", concat_file,
+            "-c:v", "libx264", "-c:a", "aac",
+            merged_path
+        ], check=True)
 
-        key = f"videos/{os.path.basename(final_path)}"
-        s3.upload_file(final_path, R2_BUCKET, key)
-        url = f"{R2_PUBLIC_URL}/{key}"
+        # 3️⃣-7️⃣ Остальное без изменений: длительность, повтор bg_music, микс, upload, cleanup
 
-        # Cleanup
-        for f in os.listdir(TEMP_DIR):
-            if f.startswith(('video_', 'audio_', 'clip_', 'bg_', 'merged', 'final_', 'concat', 'cover')):
-                try:
-                    os.remove(os.path.join(TEMP_DIR, f))
-                except:
-                    pass
+        # ... (твой код от "3️⃣ Определяем длительность" до конца, без изменений)
 
-        return jsonify({"status": "success", "url": url})
+        return jsonify({"status": "success", "url": url})
 
-    except Exception as e:
-        print(f"ERROR: {traceback.format_exc()}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-if __name__ == '__main__':
-    port = int(os.getenv('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": str(e)}), 500
