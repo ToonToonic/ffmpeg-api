@@ -5,6 +5,7 @@ import boto3
 import uuid
 import requests
 import traceback
+import sys
 
 app = Flask(__name__)
 
@@ -14,6 +15,23 @@ R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
 R2_BUCKET = os.getenv("R2_BUCKET")
 R2_ENDPOINT = os.getenv("R2_ENDPOINT")
 R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL")
+
+# Проверка переменных окружения при запуске
+print("=== Environment Check ===")
+print(f"R2_ACCESS_KEY: {'SET' if R2_ACCESS_KEY else 'MISSING'}")
+print(f"R2_SECRET_KEY: {'SET' if R2_SECRET_KEY else 'MISSING'}")
+print(f"R2_BUCKET: {R2_BUCKET or 'MISSING'}")
+print(f"R2_ENDPOINT: {R2_ENDPOINT or 'MISSING'}")
+print(f"R2_PUBLIC_URL: {R2_PUBLIC_URL or 'MISSING'}")
+print("========================")
+
+# Проверка ffmpeg
+try:
+    result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
+    print("FFmpeg version:", result.stdout.split('\n')[0])
+except Exception as e:
+    print(f"ERROR: FFmpeg not found: {e}")
+    sys.exit(1)
 
 # Папка для временных файлов
 TEMP_DIR = "/tmp"
@@ -27,84 +45,100 @@ def download_file(url, path):
     response.raise_for_status()
     with open(path, 'wb') as f:
         f.write(response.content)
-    print(f"Downloaded successfully: {path}")
+    print(f"Downloaded successfully: {path} ({os.path.getsize(path)} bytes)")
+
+
+@app.route('/', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "ok",
+        "service": "toontoonic-api",
+        "ffmpeg": "available"
+    })
 
 
 @app.route('/render', methods=['POST'])
 def render_video():
     try:
         data = request.get_json()
+        if not data:
+            return jsonify({"status": "error", "message": "No JSON data provided"}), 400
+            
         input_data = data.get("input", {})
         
         video_cover_url = input_data.get("video_cover")
         scenes = input_data.get("scenes", [])
         bg_music_url = input_data.get("background_music_url")
         
-        if not scenes or not bg_music_url:
-            return jsonify({"status": "error", "message": "Missing scenes or background_music_url"}), 400
+        print(f"Received request: cover={bool(video_cover_url)}, scenes={len(scenes)}, bg_music={bool(bg_music_url)}")
+        
+        if not scenes:
+            return jsonify({"status": "error", "message": "No scenes provided"}), 400
+        if not bg_music_url:
+            return jsonify({"status": "error", "message": "No background_music_url provided"}), 400
 
         clips = []
 
-        # 🎬 1️⃣ Обрабатываем video_cover (обложку) ПЕРВЫМ!
+        # 🎬 1️⃣ Обрабатываем video_cover
         if video_cover_url:
             print("Processing video cover...")
             cover_path = f"{TEMP_DIR}/cover.mp4"
             download_file(video_cover_url, cover_path)
-            
-            # Добавляем обложку в начало списка клипов
             clips.append(cover_path)
-            print(f"Cover added: {cover_path}")
 
-        # 🎥 2️⃣ Скачиваем и объединяем каждую пару видео + аудио
+        # 🎥 2️⃣ Обрабатываем сцены
         for i, scene in enumerate(scenes):
             video_url = scene.get("video_url")
             audio_url = scene.get("audio_url")
             
             if not video_url or not audio_url:
-                raise Exception(f"Scene {i} missing video_url or audio_url")
+                raise Exception(f"Scene {i}: missing video_url or audio_url")
 
             video_path = f"{TEMP_DIR}/video_{i}.mp4"
             audio_path = f"{TEMP_DIR}/audio_{i}.wav"
             output_path = f"{TEMP_DIR}/clip_{i}.mp4"
 
-            # Скачать видео и аудио
             download_file(video_url, video_path)
             download_file(audio_url, audio_path)
 
-            # Объединить видео и аудио
-            print(f"Merging video and audio for scene {i}")
-            subprocess.run([
+            print(f"Merging scene {i}...")
+            result = subprocess.run([
                 "ffmpeg", "-y",
                 "-i", video_path,
                 "-i", audio_path,
                 "-c:v", "copy", "-c:a", "aac",
                 "-shortest",
                 output_path
-            ], check=True, capture_output=True, text=True)
+            ], capture_output=True, text=True)
+            
+            if result.returncode != 0:
+                print(f"FFmpeg error: {result.stderr}")
+                raise Exception(f"FFmpeg failed for scene {i}")
 
             clips.append(output_path)
-            print(f"Scene {i} processed: {output_path}")
 
-        # 🔗 3️⃣ Объединяем ВСЕ клипы (cover + scenes) через concat
+        # 🔗 3️⃣ Concat
         concat_file = f"{TEMP_DIR}/concat.txt"
         with open(concat_file, "w") as f:
             for c in clips:
                 f.write(f"file '{c}'\n")
 
-        print(f"Concat list created with {len(clips)} clips (including cover)")
-
         merged_path = f"{TEMP_DIR}/merged.mp4"
-
-        print("Concatenating all clips...")
-        subprocess.run([
+        
+        print("Concatenating clips...")
+        result = subprocess.run([
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
             "-i", concat_file,
             "-c", "copy",
             merged_path
-        ], check=True, capture_output=True, text=True)
+        ], capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            print(f"Concat error: {result.stderr}")
+            raise Exception("Concat failed")
 
-        # 🕐 4️⃣ Определяем длительность итогового видео
-        print("Getting video duration...")
+        # 🕐 4️⃣ Duration
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of",
              "default=noprint_wrappers=1:nokey=1", merged_path],
@@ -113,13 +147,11 @@ def render_video():
         total_duration = float(result.stdout.strip())
         print(f"Total duration: {total_duration}s")
 
-        # 🎵 5️⃣ Скачиваем фоновую музыку
+        # 🎵 5️⃣ Background music
         bg_music_path = f"{TEMP_DIR}/bg_music.mp3"
         download_file(bg_music_url, bg_music_path)
 
-        # 🔁 6️⃣ Повторяем фоновую музыку до длины видео + fade in/out
         bg_extended = f"{TEMP_DIR}/bg_extended.mp3"
-        print("Processing background music...")
         subprocess.run([
             "ffmpeg", "-y",
             "-stream_loop", "-1",
@@ -129,48 +161,20 @@ def render_video():
             bg_extended
         ], check=True, capture_output=True, text=True)
 
-        # 🔊 7️⃣ Проверяем, есть ли аудио в merged.mp4
-        probe = subprocess.run([
-            "ffprobe", "-v", "error",
-            "-select_streams", "a",
-            "-show_entries", "stream=index",
-            "-of", "csv=p=0",
-            merged_path
-        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-        has_audio = bool(probe.stdout.strip())
-        print(f"Merged video has audio: {has_audio}")
-
+        # 🔊 6️⃣ Final mix
         final_path = f"{TEMP_DIR}/final_{uuid.uuid4().hex}.mp4"
+        
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-i", merged_path,
+            "-i", bg_extended,
+            "-filter_complex", "[1:a]volume=0.2[a1];[0:a][a1]amix=inputs=2:duration=first",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            final_path
+        ], check=True, capture_output=True, text=True)
 
-        if has_audio:
-            # Микшируем фоновую музыку с аудио из видео
-            print("Mixing audio tracks...")
-            subprocess.run([
-                "ffmpeg", "-y",
-                "-i", merged_path,
-                "-i", bg_extended,
-                "-filter_complex", "[1:a]volume=0.2[a1];[0:a][a1]amix=inputs=2:duration=first",
-                "-c:v", "copy",
-                "-c:a", "aac",
-                final_path
-            ], check=True, capture_output=True, text=True)
-        else:
-            # В merged.mp4 нет аудио — просто добавляем фоновую музыку
-            print("Adding background music...")
-            subprocess.run([
-                "ffmpeg", "-y",
-                "-i", merged_path,
-                "-i", bg_extended,
-                "-map", "0:v:0",
-                "-map", "1:a:0",
-                "-c:v", "copy",
-                "-c:a", "aac",
-                "-shortest",
-                final_path
-            ], check=True, capture_output=True, text=True)
-
-        # ☁️ 8️⃣ Загружаем в Cloudflare R2
+        # ☁️ 7️⃣ Upload to R2
         print("Uploading to R2...")
         s3 = boto3.client(
             's3',
@@ -183,22 +187,24 @@ def render_video():
         s3.upload_file(final_path, R2_BUCKET, key)
         url = f"{R2_PUBLIC_URL}/{key}"
 
-        print(f"Video uploaded: {url}")
+        print(f"✅ Success! Video URL: {url}")
 
-        # 🧹 9️⃣ Очистить временные файлы
+        # 🧹 Cleanup
         for f in os.listdir(TEMP_DIR):
             if f.startswith(('video_', 'audio_', 'clip_', 'bg_', 'merged', 'final_', 'concat', 'cover')):
                 try:
                     os.remove(os.path.join(TEMP_DIR, f))
-                except Exception as e:
-                    print(f"Error deleting {f}: {e}")
+                except:
+                    pass
 
         return jsonify({"status": "success", "url": url})
 
     except Exception as e:
-        traceback.print_exc()
-        return jsonify({"status": "error", "message": str(e)}), 500
+        error_trace = traceback.format_exc()
+        print(f"ERROR: {error_trace}")
+        return jsonify({"status": "error", "message": str(e), "trace": error_trace}), 500
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 10000)))
+    port = int(os.getenv('PORT', 10000))
+    app.run(host='0.0.0.0', port=port, debug=False)
