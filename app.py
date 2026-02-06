@@ -15,103 +15,207 @@ R2_BUCKET = os.getenv("R2_BUCKET")
 R2_ENDPOINT = os.getenv("R2_ENDPOINT")
 R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL")
 
-# Папка для временных файлов
-TEMP_DIR = "temp"
+# ✅ ВАЖНО: используй /tmp для Render!
+TEMP_DIR = "/tmp"
 os.makedirs(TEMP_DIR, exist_ok=True)
+
+@app.route('/', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "ok",
+        "service": "toontoonic-api"
+    })
 
 @app.route('/render', methods=['POST'])
 def render_video():
-    try:
-        data = request.get_json()
-        input_data = data.get("input", {})  # Фикс: берём из "input"
-        if not input_data:
-            raise Exception("No 'input' data in request")
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"status": "error", "message": "No JSON data"}), 400
+           
+        input_data = data.get("input", {})
+        if not input_data:
+            return jsonify({"status": "error", "message": "No 'input' field"}), 400
 
-        video_cover = input_data.get("video_cover")
-        scenes = input_data.get("scenes", [])
-        bg_music = input_data.get("background_music_url")
+        video_cover = input_data.get("video_cover")
+        scenes = input_data.get("scenes", [])
+        bg_music = input_data.get("background_music_url")
 
-        if not scenes:
-            raise Exception("No scenes provided")
-        if not bg_music:
-            raise Exception("No background_music_url provided")
+        if not scenes:
+            return jsonify({"status": "error", "message": "No scenes"}), 400
+        if not bg_music:
+            return jsonify({"status": "error", "message": "No background_music_url"}), 400
 
-        clips = []
+        clips = []
 
-        # 0️⃣ Обработка video_cover (вставляем в начало)
-        if video_cover:
-            # Проверяем доступность
-            head = requests.head(video_cover)
-            if head.status_code != 200:
-                raise Exception(f"Cover URL not accessible: {video_cover}")
+        # 0️⃣ Обработка video_cover (вставляем в начало)
+        if video_cover:
+            print(f"Downloading cover: {video_cover}")
+            cover_path = f"{TEMP_DIR}/cover.mp4"
+            r = requests.get(video_cover, timeout=60)
+            r.raise_for_status()
+            with open(cover_path, 'wb') as f:
+                f.write(r.content)
+            clips.append(cover_path)
+            print(f"Cover downloaded: {cover_path}")
 
-            cover_path = f"{TEMP_DIR}/cover.mp4"
-            r = requests.get(video_cover)
-            r.raise_for_status()
-            with open(cover_path, 'wb') as f:
-                f.write(r.content)
-            
-            clips.append(cover_path)  # Добавляем как первый клип (без аудио)
+        # 1️⃣ Скачиваем и объединяем каждую пару видео + аудио
+        for i, scene in enumerate(scenes):
+            video_url = scene.get("video_url")
+            audio_url = scene.get("audio_url")
+           
+            if not video_url or not audio_url:
+                print(f"Warning: Scene {i} missing video or audio URL, skipping")
+                continue
 
-        # 1️⃣ Скачиваем и объединяем каждую пару видео + аудио (как раньше)
-        for i, scene in enumerate(scenes):
-            video_url = scene["video_url"]
-            audio_url = scene["audio_url"]
+            video_path = f"{TEMP_DIR}/video_{i}.mp4"
+            audio_path = f"{TEMP_DIR}/audio_{i}.wav"
+            output_path = f"{TEMP_DIR}/clip_{i}.mp4"
 
-            # Проверяем доступность
-            for url in [video_url, audio_url]:
-                head = requests.head(url)
-                if head.status_code != 200:
-                    raise Exception(f"URL not accessible: {url}")
+            print(f"Downloading scene {i}...")
+            # Скачать видео
+            r = requests.get(video_url, timeout=60)
+            r.raise_for_status()
+            with open(video_path, 'wb') as f:
+                f.write(r.content)
 
-            video_path = f"{TEMP_DIR}/video_{i}.mp4"
-            audio_path = f"{TEMP_DIR}/audio_{i}.wav"
-            output_path = f"{TEMP_DIR}/clip_{i}.mp4"
+            # Скачать аудио
+            r = requests.get(audio_url, timeout=60)
+            r.raise_for_status()
+            with open(audio_path, 'wb') as f:
+                f.write(r.content)
 
-            # Скачать файлы
-            for url, path in [(video_url, video_path), (audio_url, audio_path)]:
-                r = requests.get(url)
-                r.raise_for_status()
-                with open(path, 'wb') as f:
-                    f.write(r.content)
+            # Объединить видео и аудио
+            print(f"Merging scene {i}...")
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-i", video_path,
+                "-i", audio_path,
+                "-c:v", "copy", "-c:a", "aac",
+                "-shortest",
+                output_path
+            ], check=True, capture_output=True, text=True)
 
-            # Объединить видео и аудио
-            subprocess.run([
-                "ffmpeg", "-y",
-                "-i", video_path,
-                "-i", audio_path,
-                "-c:v", "copy", "-c:a", "aac",
-                output_path
-            ], check=True)
+            clips.append(output_path)
+            print(f"Scene {i} processed")
 
-            clips.append(output_path)
+        # 2️⃣ Объединяем все клипы через concat
+        concat_file = f"{TEMP_DIR}/concat.txt"
+        with open(concat_file, "w") as f:
+            for c in clips:
+                f.write(f"file '{c}'\n")
 
-        # Проверяем bg_music
-        head = requests.head(bg_music)
-        if head.status_code != 200:
-            raise Exception(f"Background music URL not accessible: {bg_music}")
+        merged_path = f"{TEMP_DIR}/merged.mp4"
 
-        # 2️⃣ Объединяем все клипы через concat (как раньше)
-        concat_file = f"{TEMP_DIR}/concat.txt"
-        with open(concat_file, "w") as f:
-            for c in clips:
-                f.write(f"file '{os.path.abspath(c)}'\n")
+        print("Concatenating clips...")
+        subprocess.run([
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", concat_file,
+            "-c", "copy",
+            merged_path
+        ], check=True, capture_output=True, text=True)
 
-        merged_path = f"{TEMP_DIR}/merged.mp4"
+        # 3️⃣ Определяем длительность итогового видео
+        print("Getting duration...")
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of",
+             "default=noprint_wrappers=1:nokey=1", merged_path],
+            stdout=subprocess.PIPE, text=True, check=True
+        )
+        total_duration = float(result.stdout.strip())
+        print(f"Total duration: {total_duration}s")
 
-        subprocess.run([
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", concat_file,
-            "-c:v", "libx264", "-c:a", "aac",
-            merged_path
-        ], check=True)
+        # 4️⃣ Скачиваем фоновую музыку
+        bg_music_path = f"{TEMP_DIR}/bg_music.mp3"
+        print(f"Downloading background music: {bg_music}")
+        r = requests.get(bg_music, timeout=60)
+        r.raise_for_status()
+        with open(bg_music_path, 'wb') as f:
+            f.write(r.content)
 
-        # 3️⃣-7️⃣ Остальное без изменений: длительность, повтор bg_music, микс, upload, cleanup
+        # 5️⃣ Повторяем фоновую музыку до длины видео + fade in/out
+        bg_extended = f"{TEMP_DIR}/bg_extended.mp3"
+        print("Processing background music...")
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-stream_loop", "-1",
+            "-i", bg_music_path,
+            "-t", str(total_duration),
+            "-af", f"afade=t=in:ss=0:d=3,afade=t=out:st={max(0, total_duration - 3)}:d=3",
+            bg_extended
+        ], check=True, capture_output=True, text=True)
 
-        # ... (твой код от "3️⃣ Определяем длительность" до конца, без изменений)
+        # 6️⃣ Проверяем, есть ли аудио в merged.mp4
+        probe = subprocess.run([
+            "ffprobe", "-v", "error",
+            "-select_streams", "a",
+            "-show_entries", "stream=index",
+            "-of", "csv=p=0",
+            merged_path
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-        return jsonify({"status": "success", "url": url})
+        has_audio = bool(probe.stdout.strip())
+        print(f"Merged video has audio: {has_audio}")
 
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"status": "error", "message": str(e)}), 500
+        final_path = f"{TEMP_DIR}/final_{uuid.uuid4().hex}.mp4"
+
+        # 7️⃣ Микшируем аудио
+        print("Creating final video...")
+        if has_audio:
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-i", merged_path,
+                "-i", bg_extended,
+                "-filter_complex", "[1:a]volume=0.2[a1];[0:a][a1]amix=inputs=2:duration=first",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                final_path
+            ], check=True, capture_output=True, text=True)
+        else:
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-i", merged_path,
+                "-i", bg_extended,
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-shortest",
+                final_path
+            ], check=True, capture_output=True, text=True)
+
+        # 8️⃣ Загружаем в Cloudflare R2
+        print("Uploading to R2...")
+        s3 = boto3.client(
+            's3',
+            endpoint_url=R2_ENDPOINT,
+            aws_access_key_id=R2_ACCESS_KEY,
+            aws_secret_access_key=R2_SECRET_KEY,
+        )
+
+        key = f"videos/{os.path.basename(final_path)}"
+        s3.upload_file(final_path, R2_BUCKET, key)
+        url = f"{R2_PUBLIC_URL}/{key}"
+
+        print(f"✅ Success! URL: {url}")
+
+        # 9️⃣ Очистить временные файлы
+        for f in os.listdir(TEMP_DIR):
+            if f.startswith(('video_', 'audio_', 'clip_', 'bg_', 'merged', 'final_', 'concat', 'cover')):
+                try:
+                    os.remove(os.path.join(TEMP_DIR, f))
+                except:
+                    pass
+
+        return jsonify({"status": "success", "url": url})
+
+    except Exception as e:
+        error_msg = traceback.format_exc()
+        print(f"ERROR: {error_msg}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+if __name__ == '__main__':
+    port = int(os.getenv('PORT', 10000))
+    print(f"Starting server on port {port}")
+    app.run(host='0.0.0.0', port=port)
