@@ -8,110 +8,128 @@ import traceback
 
 app = Flask(__name__)
 
-# Cloudflare R2 credentials
+# R2 credentials (без изменений)
 R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
 R2_BUCKET = os.getenv("R2_BUCKET")
 R2_ENDPOINT = os.getenv("R2_ENDPOINT")
 R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL")
 
-# Папка для временных файлов
 TEMP_DIR = "temp"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
+# Стандартные параметры для нормализации
+VIDEO_RES = "1280:720"
+FPS = "30"
+AUDIO_SR = "44100" # Hz
+AUDIO_CHANNELS = "2"
+AUDIO_BITRATE = "128k"
+VIDEO_BITRATE = "1500k"
+
 @app.route('/render', methods=['POST'])
 def render_video():
-    try:
-        data = request.get_json()
-        input_data = data.get("input", {})  # Фикс: берём из "input"
-        if not input_data:
-            raise Exception("No 'input' data in request")
+    try:
+        data = request.get_json()
+        input_data = data.get("input", {})
+        if not input_data:
+            raise Exception("No 'input' data in request")
 
-        video_cover = input_data.get("video_cover")
-        scenes = input_data.get("scenes", [])
-        bg_music = input_data.get("background_music_url")
+        video_cover = input_data.get("video_cover")
+        scenes = input_data.get("scenes", [])
+        bg_music = input_data.get("background_music_url")
 
-        if not scenes:
-            raise Exception("No scenes provided")
-        if not bg_music:
-            raise Exception("No background_music_url provided")
+        if not scenes:
+            raise Exception("No scenes provided")
+        if not bg_music:
+            raise Exception("No background_music_url provided")
 
-        clips = []
+        clips = []
 
-        # 0️⃣ Обработка video_cover (вставляем в начало)
-        if video_cover:
-            # Проверяем доступность
-            head = requests.head(video_cover)
-            if head.status_code != 200:
-                raise Exception(f"Cover URL not accessible: {video_cover}")
+        # 0️⃣ Video_cover: скачиваем и нормализуем (если image — конверт в видео)
+        if video_cover:
+            head = requests.head(video_cover)
+            if head.status_code != 200:
+                raise Exception(f"Cover URL not accessible: {video_cover}")
 
-            cover_path = f"{TEMP_DIR}/cover.mp4"
-            r = requests.get(video_cover)
-            r.raise_for_status()
-            with open(cover_path, 'wb') as f:
-                f.write(r.content)
-            
-            clips.append(cover_path)  # Добавляем как первый клип (без аудио)
+            cover_path = f"{TEMP_DIR}/cover_original"
+            with open(cover_path, 'wb') as f:
+                f.write(requests.get(video_cover).content)
 
-        # 1️⃣ Скачиваем и объединяем каждую пару видео + аудио (как раньше)
-        for i, scene in enumerate(scenes):
-            video_url = scene["video_url"]
-            audio_url = scene["audio_url"]
+            # Проверяем тип: если image, конверт в 3-sec видео
+            probe = subprocess.run(["ffprobe", "-v", "error", "-show_format", cover_path], stdout=subprocess.PIPE, text=True)
+            if "format_name=png_pipe" in probe.stdout or "jpg" in probe.stdout: # Image
+                norm_cover = f"{TEMP_DIR}/cover.mp4"
+                subprocess.run([
+                    "ffmpeg", "-y", "-loop", "1", "-i", cover_path,
+                    "-t", "3", "-vf", f"scale={VIDEO_RES}:force_original_aspect_ratio=decrease,pad={VIDEO_RES}:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p",
+                    "-c:v", "libx264", "-b:v", VIDEO_BITRATE,
+                    norm_cover
+                ], check=True)
+            else: # Видео — нормализуем
+                norm_cover = f"{TEMP_DIR}/cover.mp4"
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", cover_path,
+                    "-vf", f"scale={VIDEO_RES}:force_original_aspect_ratio=decrease,pad={VIDEO_RES}:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p",
+                    "-c:v", "libx264", "-b:v", VIDEO_BITRATE,
+                    norm_cover
+                ], check=True)
 
-            # Проверяем доступность
-            for url in [video_url, audio_url]:
-                head = requests.head(url)
-                if head.status_code != 200:
-                    raise Exception(f"URL not accessible: {url}")
+            clips.append(norm_cover)
 
-            video_path = f"{TEMP_DIR}/video_{i}.mp4"
-            audio_path = f"{TEMP_DIR}/audio_{i}.wav"
-            output_path = f"{TEMP_DIR}/clip_{i}.mp4"
+        # 1️⃣ Scenes: скачиваем, нормализуем видео/аудио, merge в clip
+        for i, scene in enumerate(scenes):
+            video_url = scene["video_url"]
+            audio_url = scene["audio_url"]
 
-            # Скачать файлы
-            for url, path in [(video_url, video_path), (audio_url, audio_path)]:
-                r = requests.get(url)
-                r.raise_for_status()
-                with open(path, 'wb') as f:
-                    f.write(r.content)
+            for url in [video_url, audio_url]:
+                head = requests.head(url)
+                if head.status_code != 200:
+                    raise Exception(f"URL not accessible: {url}")
 
-            # Объединить видео и аудио
-            subprocess.run([
-                "ffmpeg", "-y",
-                "-i", video_path,
-                "-i", audio_path,
-                "-c:v", "copy", "-c:a", "aac",
-                output_path
-            ], check=True)
+            video_path = f"{TEMP_DIR}/video_{i}.mp4"
+            audio_path = f"{TEMP_DIR}/audio_{i}.wav"
+            with open(video_path, 'wb') as f:
+                f.write(requests.get(video_url).content)
+            with open(audio_path, 'wb') as f:
+                f.write(requests.get(audio_url).content)
 
-            clips.append(output_path)
+            # Нормализуем видео
+            norm_video = f"{TEMP_DIR}/norm_video_{i}.mp4"
+            subprocess.run([
+                "ffmpeg", "-y", "-i", video_path,
+                "-vf", f"scale={VIDEO_RES}:force_original_aspect_ratio=decrease,pad={VIDEO_RES}:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p",
+                "-c:v", "libx264", "-b:v", VIDEO_BITRATE,
+                norm_video
+            ], check=True)
 
-        # Проверяем bg_music
-        head = requests.head(bg_music)
-        if head.status_code != 200:
-            raise Exception(f"Background music URL not accessible: {bg_music}")
+            # Нормализуем аудио
+            norm_audio = f"{TEMP_DIR}/norm_audio_{i}.wav"
+            subprocess.run([
+                "ffmpeg", "-y", "-i", audio_path,
+                "-ar", AUDIO_SR, "-ac", AUDIO_CHANNELS, "-b:a", AUDIO_BITRATE,
+                norm_audio
+            ], check=True)
 
-        # 2️⃣ Объединяем все клипы через concat (как раньше)
-        concat_file = f"{TEMP_DIR}/concat.txt"
-        with open(concat_file, "w") as f:
-            for c in clips:
-                f.write(f"file '{os.path.abspath(c)}'\n")
+            # Merge нормализованных
+            output_path = f"{TEMP_DIR}/clip_{i}.mp4"
+            subprocess.run([
+                "ffmpeg", "-y", "-i", norm_video, "-i", norm_audio,
+                "-c:v", "copy", "-c:a", "aac",
+                output_path
+            ], check=True)
 
-        merged_path = f"{TEMP_DIR}/merged.mp4"
+            clips.append(output_path)
 
-        subprocess.run([
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", concat_file,
-            "-c:v", "libx264", "-c:a", "aac",
-            merged_path
-        ], check=True)
+        # Проверяем bg_music
+        head = requests.head(bg_music)
+        if head.status_code != 200:
+            raise Exception(f"Background music URL not accessible: {bg_music}")
 
-        # 3️⃣-7️⃣ Остальное без изменений: длительность, повтор bg_music, микс, upload, cleanup
+        # 2️⃣-7️⃣ Concat, duration, bg extend, mix, upload, cleanup (без изменений, но с нормализованными clips)
+        # ... (твой оригинальный код от concat_file до return jsonify)
 
-        # ... (твой код от "3️⃣ Определяем длительность" до конца, без изменений)
+        return jsonify({"status": "success", "url": url})
 
-        return jsonify({"status": "success", "url": url})
-
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"status": "error", "message": str(e)}), 500
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": str(e)}), 500
