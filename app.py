@@ -3,8 +3,7 @@ import subprocess
 import os
 import boto3
 import uuid
-import aiohttp
-import asyncio
+import requests
 import traceback
 import time
 
@@ -19,18 +18,13 @@ R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL")
 TEMP_DIR = "temp"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-async def download_file(session, url, path):
-    async with session.get(url) as r:
-        r.raise_for_status()
-        with open(path, 'wb') as f:
-            f.write(await r.read())
-
 @app.route('/render', methods=['POST'])
-async def render_video():
+def render_video():
     start_time = time.time()
     print(f"[START] Render started at {start_time}")
     try:
         data = request.get_json()
+        print(f"[DEBUG] Received data: {data}")  # Debug input
         input_data = data.get("input", {})
         if not input_data:
             raise Exception("No 'input' data in request")
@@ -39,6 +33,8 @@ async def render_video():
         scenes = input_data.get("scenes", [])
         bg_music = input_data.get("background_music_url")
 
+        print(f"[DEBUG] Scenes count: {len(scenes)}, Cover: {video_cover}, BG: {bg_music}")
+
         if not scenes:
             raise Exception("No scenes provided")
         if not bg_music:
@@ -46,51 +42,67 @@ async def render_video():
 
         clips = []
 
-        async with aiohttp.ClientSession() as session:
-            if video_cover:
-                async with session.head(video_cover) as head:
-                    if head.status != 200:
-                        raise Exception(f"Cover URL not accessible: {video_cover}")
+        # 0️⃣ Обработка video_cover
+        if video_cover:
+            head = requests.head(video_cover)
+            if head.status_code != 200:
+                raise Exception(f"Cover URL not accessible: {video_cover}")
 
-                cover_path = f"{TEMP_DIR}/cover.mp4"
-                await download_file(session, video_cover, cover_path)
-                probe = subprocess.run(["ffprobe", "-v", "error", "-show_format", cover_path], stdout=subprocess.PIPE, text=True)
-                if "png" in probe.stdout or "jpg" in probe.stdout:
-                    subprocess.run(["ffmpeg", "-y", "-loop", "1", "-i", cover_path, "-t", "3", "-c:v", "libx264", cover_path], check=True)
-                clips.append(cover_path)
-                print(f"[TIME] Cover processed in {time.time() - start_time} sec")
+            cover_path = f"{TEMP_DIR}/cover.mp4"
+            r = requests.get(video_cover)
+            r.raise_for_status()
+            with open(cover_path, 'wb') as f:
+                f.write(r.content)
+            # Если cover - image, конверт в 3-sec видео
+            probe = subprocess.run(["ffprobe", "-v", "error", "-show_format", cover_path], stdout=subprocess.PIPE, text=True)
+            if "png" in probe.stdout or "jpg" in probe.stdout:
+                subprocess.run(["ffmpeg", "-y", "-loop", "1", "-i", cover_path, "-t", "3", "-c:v", "libx264", cover_path], check=True)
+            clips.append(cover_path)
+            print(f"[TIME] Cover processed in {time.time() - start_time} sec")
 
-            for i, scene in enumerate(scenes):
-                video_url = scene["video_url"]
-                audio_url = scene["audio_url"]
+        # 1️⃣ Скачиваем и объединяем каждую пару видео + аудио
+        for i, scene in enumerate(scenes):
+            video_url = scene.get("video_url")
+            audio_url = scene.get("audio_url")
+            print(f"[DEBUG] Scene {i}: Video {video_url}, Audio {audio_url}")
 
-                for url in [video_url, audio_url]:
-                    async with session.head(url) as head:
-                        if head.status != 200:
-                            raise Exception(f"URL not accessible: {url}")
+            for url in [video_url, audio_url]:
+                if not url:
+                    raise Exception(f"Missing URL in scene {i}")
+                head = requests.head(url)
+                if head.status_code != 200:
+                    raise Exception(f"URL not accessible: {url}")
 
-                video_path = f"{TEMP_DIR}/video_{i}.mp4"
-                audio_path = f"{TEMP_DIR}/audio_{i}.wav"
-                output_path = f"{TEMP_DIR}/clip_{i}.mp4"
+            video_path = f"{TEMP_DIR}/video_{i}.mp4"
+            audio_path = f"{TEMP_DIR}/audio_{i}.wav"
+            output_path = f"{TEMP_DIR}/clip_{i}.mp4"
 
-                await download_file(session, video_url, video_path)
-                await download_file(session, audio_url, audio_path)
+            r = requests.get(video_url)
+            r.raise_for_status()
+            with open(video_path, 'wb') as f:
+                f.write(r.content)
+            r = requests.get(audio_url)
+            r.raise_for_status()
+            with open(audio_path, 'wb') as f:
+                f.write(r.content)
 
-                subprocess.run([
-                    "ffmpeg", "-y",
-                    "-i", video_path,
-                    "-i", audio_path,
-                    "-c:v", "copy", "-c:a", "aac",
-                    output_path
-                ], check=True)
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-i", video_path,
+                "-i", audio_path,
+                "-c:v", "copy", "-c:a", "aac",
+                output_path
+            ], check=True, stderr=subprocess.PIPE)  # Добавь stderr для debug FFmpeg errors
 
-                clips.append(output_path)
-                print(f"[TIME] Scene {i} processed in {time.time() - start_time} sec")
+            clips.append(output_path)
+            print(f"[TIME] Scene {i} processed in {time.time() - start_time} sec")
 
-            async with session.head(bg_music) as head:
-                if head.status != 200:
-                    raise Exception(f"Background music URL not accessible: {bg_music}")
+        # Проверяем bg_music
+        head = requests.head(bg_music)
+        if head.status_code != 200:
+            raise Exception(f"Background music URL not accessible: {bg_music}")
 
+        # 2️⃣ Объединяем все клипы через concat
         concat_file = f"{TEMP_DIR}/concat.txt"
         with open(concat_file, "w") as f:
             for c in clips:
@@ -98,14 +110,17 @@ async def render_video():
 
         merged_path = f"{TEMP_DIR}/merged.mp4"
 
-        subprocess.run([
+        concat_result = subprocess.run([
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
             "-i", concat_file,
             "-c:v", "libx264", "-c:a", "aac",
             merged_path
-        ], check=True)
+        ], check=True, stderr=subprocess.PIPE)
+        print(f"[DEBUG] Concat stderr: {concat_result.stderr}")
+
         print(f"[TIME] Concat done in {time.time() - start_time} sec")
 
+        # 3️⃣ Определяем длительность итогового видео
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of",
              "default=noprint_wrappers=1:nokey=1", merged_path],
@@ -114,6 +129,7 @@ async def render_video():
         total_duration = float(result.stdout.strip())
         print(f"[TIME] Duration probe done in {time.time() - start_time} sec")
 
+        # 4️⃣ Повторяем фоновую музыку до длины видео + fade in/out
         bg_extended = f"{TEMP_DIR}/bg_extended.mp3"
         subprocess.run([
             "ffmpeg", "-y",
@@ -125,6 +141,7 @@ async def render_video():
         ], check=True)
         print(f"[TIME] BG music extended in {time.time() - start_time} sec")
 
+        # 5️⃣ Проверяем, есть ли аудио в merged.mp4
         probe = subprocess.run([
             "ffprobe", "-v", "error",
             "-select_streams", "a",
@@ -160,6 +177,7 @@ async def render_video():
             ], check=True)
         print(f"[TIME] Audio mix done in {time.time() - start_time} sec")
 
+        # 6️⃣ Загружаем в Cloudflare R2
         s3 = boto3.client(
             's3',
             endpoint_url=R2_ENDPOINT,
@@ -172,6 +190,7 @@ async def render_video():
         url = f"{R2_PUBLIC_URL}/{key}"
         print(f"[TIME] Upload done in {time.time() - start_time} sec")
 
+        # 7️⃣ Очистить временные файлы
         for f in os.listdir(TEMP_DIR):
             try:
                 os.remove(os.path.join(TEMP_DIR, f))
@@ -182,6 +201,7 @@ async def render_video():
         return jsonify({"status": "success", "url": url})
 
     except Exception as e:
+        print(f"[ERROR] Exception: {str(e)}")
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
