@@ -13,7 +13,7 @@ R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
 R2_BUCKET = os.getenv("R2_BUCKET")
 R2_ENDPOINT = os.getenv("R2_ENDPOINT")
-R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL")
+R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL")  # Убедись, что добавлен в Render
 
 # Папка для временных файлов
 TEMP_DIR = "temp"
@@ -106,12 +106,86 @@ def render_video():
             merged_path
         ], check=True)
 
-        # 3️⃣-7️⃣ Остальное без изменений: длительность, повтор bg_music, микс, upload, cleanup
+        # 3️⃣ Определяем длительность итогового видео
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of",
+             "default=noprint_wrappers=1:nokey=1", merged_path],
+            stdout=subprocess.PIPE, text=True
+        )
+        total_duration = float(result.stdout.strip())
 
-        # ... (твой код от "3️⃣ Определяем длительность" до конца, без изменений)
+        # 4️⃣ Повторяем фоновую музыку до длины видео + fade in/out
+        bg_extended = f"{TEMP_DIR}/bg_extended.mp3"
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-stream_loop", "-1",
+            "-i", bg_music,
+            "-t", str(total_duration),
+            "-af", f"afade=t=in:ss=0:d=3,afade=t=out:st={total_duration - 3}:d=3",
+            bg_extended
+        ], check=True)
+
+        # 5️⃣ Проверяем, есть ли аудио в merged.mp4
+        probe = subprocess.run([
+            "ffprobe", "-v", "error",
+            "-select_streams", "a",
+            "-show_entries", "stream=index",
+            "-of", "csv=p=0",
+            merged_path
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        has_audio = bool(probe.stdout.strip())
+
+        final_path = f"{TEMP_DIR}/final_{uuid.uuid4().hex}.mp4"
+
+        if has_audio:
+            # Микшируем фоновую музыку с аудио из видео
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-i", merged_path,
+                "-i", bg_extended,
+                "-filter_complex", "[1:a]volume=0.2[a1];[0:a][a1]amix=inputs=2:duration=longest",
+                "-c:v", "copy",
+                "-shortest", final_path
+            ], check=True)
+        else:
+            # В merged.mp4 нет аудио — просто добавляем фоновую музыку
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-i", merged_path,
+                "-i", bg_extended,
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-shortest",
+                final_path
+            ], check=True)
+
+        # 6️⃣ Загружаем в Cloudflare R2
+        s3 = boto3.client(
+            's3',
+            endpoint_url=R2_ENDPOINT,
+            aws_access_key_id=R2_ACCESS_KEY,
+            aws_secret_access_key=R2_SECRET_KEY,
+        )
+
+        key = f"videos/{os.path.basename(final_path)}"
+        s3.upload_file(final_path, R2_BUCKET, key)
+        url = f"{R2_PUBLIC_URL}/{key}"
+
+        # 7️⃣ Очистить временные файлы
+        for f in os.listdir(TEMP_DIR):
+            try:
+                os.remove(os.path.join(TEMP_DIR, f))
+            except:
+                pass
 
         return jsonify({"status": "success", "url": url})
 
     except Exception as e:
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True)
