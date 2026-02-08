@@ -22,7 +22,7 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 # Стандартные параметры для нормализации
 VIDEO_RES = "1280:720"
 FPS = "30"
-AUDIO_SR = "44100"  # Hz
+AUDIO_SR = "44100" # Hz
 AUDIO_CHANNELS = "2"
 AUDIO_BITRATE = "128k"
 VIDEO_BITRATE = "1500k"
@@ -58,7 +58,7 @@ def render_video():
 
             # Проверяем тип: если image, конверт в 3-sec видео
             probe = subprocess.run(["ffprobe", "-v", "error", "-show_format", cover_path], stdout=subprocess.PIPE, text=True)
-            if "format_name=png_pipe" in probe.stdout or "jpg" in probe.stdout:  # Image
+            if "format_name=png_pipe" in probe.stdout or "jpg" in probe.stdout: # Image
                 norm_cover = f"{TEMP_DIR}/cover.mp4"
                 subprocess.run([
                     "ffmpeg", "-y", "-loop", "1", "-i", cover_path,
@@ -66,7 +66,7 @@ def render_video():
                     "-c:v", "libx264", "-b:v", VIDEO_BITRATE,
                     norm_cover
                 ], check=True)
-            else:  # Видео — нормализуем
+            else: # Видео — нормализуем
                 norm_cover = f"{TEMP_DIR}/cover.mp4"
                 subprocess.run([
                     "ffmpeg", "-y", "-i", cover_path,
