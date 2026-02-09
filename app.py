@@ -68,16 +68,16 @@ def render_video():
                 subprocess.run([
                     "ffmpeg", "-y", "-loop", "1", "-i", cover_path,
                     "-t", "3", "-vf", f"scale={VIDEO_RES}:force_original_aspect_ratio=decrease,pad={VIDEO_RES}:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p",
-                    "-c:v", "libx264", "-b:v", VIDEO_BITRATE, "-preset", "fast",
+                    "-c:v", "libx264", "-b:v", VIDEO_BITRATE, "-preset", "ultrafast",
                     norm_cover
-                ], check=True, timeout=60)
+                ], check=True, timeout=120)  # Increased timeout
             else:
                 subprocess.run([
                     "ffmpeg", "-y", "-i", cover_path,
                     "-vf", f"scale={VIDEO_RES}:force_original_aspect_ratio=decrease,pad={VIDEO_RES}:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p",
-                    "-c:v", "libx264", "-b:v", VIDEO_BITRATE, "-preset", "fast",
+                    "-c:v", "libx264", "-b:v", VIDEO_BITRATE, "-preset", "ultrafast",
                     norm_cover
-                ], check=True, timeout=60)
+                ], check=True, timeout=120)  # Increased timeout
 
             clips.append(norm_cover)
             print(f"[TIME] Cover processed in {time.time() - start_time} sec")
@@ -113,25 +113,26 @@ def render_video():
             subprocess.run([
                 "ffmpeg", "-y", "-i", video_path,
                 "-vf", f"scale={VIDEO_RES}:force_original_aspect_ratio=decrease,pad={VIDEO_RES}:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p",
-                "-c:v", "libx264", "-b:v", VIDEO_BITRATE, "-preset", "fast",
+                "-c:v", "libx264", "-b:v", VIDEO_BITRATE, "-preset", "ultrafast",
                 norm_video
-            ], check=True, timeout=60)
+            ], check=True, timeout=120)
 
-            # Нормализуем аудио (фикс ошибок)
+            # Нормализуем аудио
             norm_audio = f"{TEMP_DIR}/norm_audio_{i}.aac"
             subprocess.run([
                 "ffmpeg", "-y", "-i", audio_path,
                 "-ar", AUDIO_SR, "-ac", AUDIO_CHANNELS, "-b:a", AUDIO_BITRATE,
-                "-c:a", "aac", "-strict", "-2", norm_audio
-            ], check=True, timeout=60)
+                "-c:a", "aac", "-strict", "-2",
+                norm_audio
+            ], check=True, timeout=120)
 
             # Merge
             output_path = f"{TEMP_DIR}/clip_{i}.mp4"
             subprocess.run([
                 "ffmpeg", "-y", "-i", norm_video, "-i", norm_audio,
-                "-c:v", "libx264", "-c:a", "aac", "-preset", "fast",
+                "-c:v", "libx264", "-c:a", "aac", "-preset", "ultrafast",
                 output_path
-            ], check=True, timeout=60)
+            ], check=True, timeout=120)
 
             clips.append(output_path)
             print(f"[TIME] Scene {i} processed in {time.time() - start_time} sec")
@@ -153,9 +154,9 @@ def render_video():
         subprocess.run([
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
             "-i", concat_file,
-            "-c:v", "libx264", "-c:a", "aac", "-preset", "fast",
+            "-c:v", "libx264", "-c:a", "aac", "-preset", "ultrafast",
             merged_path
-        ], check=True, timeout=300)
+        ], check=True, timeout=600)  # Longer for concat
         print(f"[TIME] Concat done in {time.time() - start_time} sec")
 
         # 3️⃣ Duration
@@ -176,7 +177,7 @@ def render_video():
             "-t", str(total_duration),
             "-af", f"afade=t=in:ss=0:d=3,afade=t=out:st={total_duration - 3}:d=3",
             bg_extended
-        ], check=True, timeout=60)
+        ], check=True, timeout=120)
         print(f"[TIME] BG music extended in {time.time() - start_time} sec")
 
         # 5️⃣ Check audio in merged
@@ -198,10 +199,10 @@ def render_video():
                 "ffmpeg", "-y",
                 "-i", merged_path,
                 "-i", bg_extended,
-                "-filter_complex", "[0:a]volume=1.0[a0];[1:a]volume=0.1[a1];[a0][a1]amix=inputs=2:duration=longest",  # Основное аудио громче (1.0), bg тише (0.1)
+                "-filter_complex", "[0:a]volume=1.0[a0];[1:a]volume=0.1[a1];[a0][a1]amix=inputs=2:duration=longest",
                 "-c:v", "copy",
                 "-shortest", final_path
-            ], check=True, timeout=120)
+            ], check=True, timeout=300)
         else:
             print("[WARNING] No audio in merged — adding bg only")
             subprocess.run([
@@ -214,7 +215,7 @@ def render_video():
                 "-c:a", "aac",
                 "-shortest",
                 final_path
-            ], check=True, timeout=120)
+            ], check=True, timeout=300)
         print(f"[TIME] Audio mix done in {time.time() - start_time} sec")
 
         # 6️⃣ Upload
