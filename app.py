@@ -18,13 +18,20 @@ R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL")
 TEMP_DIR = "temp"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
+VIDEO_RES = "1280:720"
+FPS = "30"
+AUDIO_SR = "44100"
+AUDIO_CHANNELS = "2"
+AUDIO_BITRATE = "128k"
+VIDEO_BITRATE = "1500k"
+
 @app.route('/render', methods=['POST'])
 def render_video():
     start_time = time.time()
     print(f"[START] Render started at {start_time}")
     try:
         data = request.get_json()
-        print(f"[DEBUG] Received data: {data}")  # Debug input
+        print(f"[DEBUG] Received data: {data}")
         input_data = data.get("input", {})
         if not input_data:
             raise Exception("No 'input' data in request")
@@ -42,25 +49,40 @@ def render_video():
 
         clips = []
 
-        # 0️⃣ Обработка video_cover
+        # 0️⃣ Cover
         if video_cover:
             head = requests.head(video_cover)
+            print(f"[DEBUG] Cover head status: {head.status_code}")
             if head.status_code != 200:
                 raise Exception(f"Cover URL not accessible: {video_cover}")
 
-            cover_path = f"{TEMP_DIR}/cover.mp4"
+            cover_path = f"{TEMP_DIR}/cover_original"
             r = requests.get(video_cover)
             r.raise_for_status()
             with open(cover_path, 'wb') as f:
                 f.write(r.content)
-            # Если cover - image, конверт в 3-sec видео
+
+            norm_cover = f"{TEMP_DIR}/cover.mp4"
             probe = subprocess.run(["ffprobe", "-v", "error", "-show_format", cover_path], stdout=subprocess.PIPE, text=True)
             if "png" in probe.stdout or "jpg" in probe.stdout:
-                subprocess.run(["ffmpeg", "-y", "-loop", "1", "-i", cover_path, "-t", "3", "-c:v", "libx264", cover_path], check=True)
-            clips.append(cover_path)
+                subprocess.run([
+                    "ffmpeg", "-y", "-loop", "1", "-i", cover_path,
+                    "-t", "3", "-vf", f"scale={VIDEO_RES}:force_original_aspect_ratio=decrease,pad={VIDEO_RES}:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p",
+                    "-c:v", "libx264", "-b:v", VIDEO_BITRATE,
+                    norm_cover
+                ], check=True)
+            else:
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", cover_path,
+                    "-vf", f"scale={VIDEO_RES}:force_original_aspect_ratio=decrease,pad={VIDEO_RES}:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p",
+                    "-c:v", "libx264", "-b:v", VIDEO_BITRATE,
+                    norm_cover
+                ], check=True)
+
+            clips.append(norm_cover)
             print(f"[TIME] Cover processed in {time.time() - start_time} sec")
 
-        # 1️⃣ Скачиваем и объединяем каждую пару видео + аудио
+        # 1️⃣ Scenes
         for i, scene in enumerate(scenes):
             video_url = scene.get("video_url")
             audio_url = scene.get("audio_url")
@@ -70,12 +92,12 @@ def render_video():
                 if not url:
                     raise Exception(f"Missing URL in scene {i}")
                 head = requests.head(url)
+                print(f"[DEBUG] URL {url} head status: {head.status_code}")
                 if head.status_code != 200:
                     raise Exception(f"URL not accessible: {url}")
 
             video_path = f"{TEMP_DIR}/video_{i}.mp4"
             audio_path = f"{TEMP_DIR}/audio_{i}.wav"
-            output_path = f"{TEMP_DIR}/clip_{i}.mp4"
 
             r = requests.get(video_url)
             r.raise_for_status()
@@ -86,23 +108,42 @@ def render_video():
             with open(audio_path, 'wb') as f:
                 f.write(r.content)
 
+            # Нормализуем видео
+            norm_video = f"{TEMP_DIR}/norm_video_{i}.mp4"
             subprocess.run([
-                "ffmpeg", "-y",
-                "-i", video_path,
-                "-i", audio_path,
-                "-c:v", "copy", "-c:a", "aac",
+                "ffmpeg", "-y", "-i", video_path,
+                "-vf", f"scale={VIDEO_RES}:force_original_aspect_ratio=decrease,pad={VIDEO_RES}:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p",
+                "-c:v", "libx264", "-b:v", VIDEO_BITRATE,
+                norm_video
+            ], check=True)
+
+            # Нормализуем аудио (фикс ошибок in logs)
+            norm_audio = f"{TEMP_DIR}/norm_audio_{i}.aac"  # AAC для лучшей совместимости
+            subprocess.run([
+                "ffmpeg", "-y", "-i", audio_path,
+                "-ar", AUDIO_SR, "-ac", AUDIO_CHANNELS, "-b:a", AUDIO_BITRATE,
+                "-c:a", "aac", "-strict", "experimental",  # Fix AAC errors
+                norm_audio
+            ], check=True)
+
+            # Merge
+            output_path = f"{TEMP_DIR}/clip_{i}.mp4"
+            subprocess.run([
+                "ffmpeg", "-y", "-i", norm_video, "-i", norm_audio,
+                "-c:v", "copy", "-c:a", "copy",
                 output_path
-            ], check=True, stderr=subprocess.PIPE)  # Добавь stderr для debug FFmpeg errors
+            ], check=True)
 
             clips.append(output_path)
             print(f"[TIME] Scene {i} processed in {time.time() - start_time} sec")
 
-        # Проверяем bg_music
+        # Bg music
         head = requests.head(bg_music)
+        print(f"[DEBUG] BG music head status: {head.status_code}")
         if head.status_code != 200:
             raise Exception(f"Background music URL not accessible: {bg_music}")
 
-        # 2️⃣ Объединяем все клипы через concat
+        # 2️⃣ Concat
         concat_file = f"{TEMP_DIR}/concat.txt"
         with open(concat_file, "w") as f:
             for c in clips:
@@ -110,17 +151,15 @@ def render_video():
 
         merged_path = f"{TEMP_DIR}/merged.mp4"
 
-        concat_result = subprocess.run([
+        subprocess.run([
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
             "-i", concat_file,
             "-c:v", "libx264", "-c:a", "aac",
             merged_path
-        ], check=True, stderr=subprocess.PIPE)
-        print(f"[DEBUG] Concat stderr: {concat_result.stderr}")
-
+        ], check=True)
         print(f"[TIME] Concat done in {time.time() - start_time} sec")
 
-        # 3️⃣ Определяем длительность итогового видео
+        # 3️⃣ Duration
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of",
              "default=noprint_wrappers=1:nokey=1", merged_path],
@@ -129,7 +168,7 @@ def render_video():
         total_duration = float(result.stdout.strip())
         print(f"[TIME] Duration probe done in {time.time() - start_time} sec")
 
-        # 4️⃣ Повторяем фоновую музыку до длины видео + fade in/out
+        # 4️⃣ Extend bg_music
         bg_extended = f"{TEMP_DIR}/bg_extended.mp3"
         subprocess.run([
             "ffmpeg", "-y",
@@ -141,7 +180,7 @@ def render_video():
         ], check=True)
         print(f"[TIME] BG music extended in {time.time() - start_time} sec")
 
-        # 5️⃣ Проверяем, есть ли аудио в merged.mp4
+        # 5️⃣ Check audio in merged
         probe = subprocess.run([
             "ffprobe", "-v", "error",
             "-select_streams", "a",
@@ -151,6 +190,7 @@ def render_video():
         ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
         has_audio = bool(probe.stdout.strip())
+        print(f"[DEBUG] Has audio in merged: {has_audio}")
 
         final_path = f"{TEMP_DIR}/final_{uuid.uuid4().hex}.mp4"
 
@@ -159,7 +199,7 @@ def render_video():
                 "ffmpeg", "-y",
                 "-i", merged_path,
                 "-i", bg_extended,
-                "-filter_complex", "[1:a]volume=0.2[a1];[0:a][a1]amix=inputs=2:duration=longest",
+                "-filter_complex", "[1:a]volume=0.1[a1];[0:a][a1]amix=inputs=2:duration=longest",  # Volume 0.1 for quieter bg
                 "-c:v", "copy",
                 "-shortest", final_path
             ], check=True)
@@ -177,7 +217,7 @@ def render_video():
             ], check=True)
         print(f"[TIME] Audio mix done in {time.time() - start_time} sec")
 
-        # 6️⃣ Загружаем в Cloudflare R2
+        # 6️⃣ Upload
         s3 = boto3.client(
             's3',
             endpoint_url=R2_ENDPOINT,
@@ -190,7 +230,7 @@ def render_video():
         url = f"{R2_PUBLIC_URL}/{key}"
         print(f"[TIME] Upload done in {time.time() - start_time} sec")
 
-        # 7️⃣ Очистить временные файлы
+        # 7️⃣ Cleanup
         for f in os.listdir(TEMP_DIR):
             try:
                 os.remove(os.path.join(TEMP_DIR, f))
