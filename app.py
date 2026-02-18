@@ -6,6 +6,7 @@ import uuid
 import requests
 import traceback
 import time
+import threading
 
 app = Flask(__name__)
 
@@ -25,22 +26,17 @@ AUDIO_CHANNELS = "2"
 AUDIO_BITRATE = "128k"
 VIDEO_BITRATE = "1500k"
 
-@app.route('/render', methods=['POST'])
-def render_video():
-    start_time = time.time()
-    print(f"[START] Render started at {start_time}")
-    try:
-        data = request.get_json()
-        print(f"[DEBUG] Received data: {data}")
-        input_data = data.get("input", {})
-        if not input_data:
-            raise Exception("No 'input' data in request")
 
+def render_in_background(job_id, input_data, callback_url):
+    """Runs FFmpeg render in background thread, then POSTs result to Make webhook."""
+    start_time = time.time()
+    job_temp = f"{TEMP_DIR}/{job_id}"
+    os.makedirs(job_temp, exist_ok=True)
+
+    try:
         video_cover = input_data.get("video_cover")
         scenes = input_data.get("scenes", [])
         bg_music = input_data.get("background_music_url")
-
-        print(f"[DEBUG] Scenes count: {len(scenes)}, Cover: {video_cover}, BG: {bg_music}")
 
         if not scenes:
             raise Exception("No scenes provided")
@@ -51,65 +47,55 @@ def render_video():
 
         # 0️⃣ Cover
         if video_cover:
-            head = requests.head(video_cover)
-            print(f"[DEBUG] Cover head status: {head.status_code}")
-            if head.status_code != 200:
-                raise Exception(f"Cover URL not accessible: {video_cover}")
-
-            cover_path = f"{TEMP_DIR}/cover_original"
-            r = requests.get(video_cover)
+            cover_path = f"{job_temp}/cover_original"
+            r = requests.get(video_cover, timeout=60)
             r.raise_for_status()
             with open(cover_path, 'wb') as f:
                 f.write(r.content)
 
-            norm_cover = f"{TEMP_DIR}/cover.mp4"
-            probe = subprocess.run(["ffprobe", "-v", "error", "-show_format", cover_path], stdout=subprocess.PIPE, text=True)
+            norm_cover = f"{job_temp}/cover.mp4"
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_format", cover_path],
+                stdout=subprocess.PIPE, text=True
+            )
             if "png" in probe.stdout or "jpg" in probe.stdout:
                 subprocess.run([
                     "ffmpeg", "-y", "-loop", "1", "-i", cover_path,
-                    "-t", "3", "-vf", f"scale={VIDEO_RES}:force_original_aspect_ratio=decrease,pad={VIDEO_RES}:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p",
+                    "-t", "3",
+                    "-vf", f"scale={VIDEO_RES}:force_original_aspect_ratio=decrease,pad={VIDEO_RES}:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p",
                     "-c:v", "libx264", "-b:v", VIDEO_BITRATE, "-preset", "ultrafast",
                     norm_cover
-                ], check=True, timeout=120)  # Increased timeout
+                ], check=True, timeout=120)
             else:
                 subprocess.run([
                     "ffmpeg", "-y", "-i", cover_path,
                     "-vf", f"scale={VIDEO_RES}:force_original_aspect_ratio=decrease,pad={VIDEO_RES}:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p",
                     "-c:v", "libx264", "-b:v", VIDEO_BITRATE, "-preset", "ultrafast",
                     norm_cover
-                ], check=True, timeout=120)  # Increased timeout
+                ], check=True, timeout=120)
 
             clips.append(norm_cover)
-            print(f"[TIME] Cover processed in {time.time() - start_time} sec")
+            print(f"[{job_id}] Cover done in {time.time() - start_time:.1f}s")
 
         # 1️⃣ Scenes
         for i, scene in enumerate(scenes):
             video_url = scene.get("video_url")
             audio_url = scene.get("audio_url")
-            print(f"[DEBUG] Scene {i}: Video {video_url}, Audio {audio_url}")
 
-            for url in [video_url, audio_url]:
-                if not url:
-                    raise Exception(f"Missing URL in scene {i}")
-                head = requests.head(url)
-                print(f"[DEBUG] URL {url} head status: {head.status_code}")
-                if head.status_code != 200:
-                    raise Exception(f"URL not accessible: {url}")
+            video_path = f"{job_temp}/video_{i}.mp4"
+            audio_path = f"{job_temp}/audio_{i}.wav"
 
-            video_path = f"{TEMP_DIR}/video_{i}.mp4"
-            audio_path = f"{TEMP_DIR}/audio_{i}.wav"
-
-            r = requests.get(video_url)
+            r = requests.get(video_url, timeout=60)
             r.raise_for_status()
             with open(video_path, 'wb') as f:
                 f.write(r.content)
-            r = requests.get(audio_url)
+
+            r = requests.get(audio_url, timeout=60)
             r.raise_for_status()
             with open(audio_path, 'wb') as f:
                 f.write(r.content)
 
-            # Нормализуем видео
-            norm_video = f"{TEMP_DIR}/norm_video_{i}.mp4"
+            norm_video = f"{job_temp}/norm_video_{i}.mp4"
             subprocess.run([
                 "ffmpeg", "-y", "-i", video_path,
                 "-vf", f"scale={VIDEO_RES}:force_original_aspect_ratio=decrease,pad={VIDEO_RES}:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p",
@@ -117,17 +103,15 @@ def render_video():
                 norm_video
             ], check=True, timeout=120)
 
-            # Нормализуем аудио
-            norm_audio = f"{TEMP_DIR}/norm_audio_{i}.aac"
+            norm_audio = f"{job_temp}/norm_audio_{i}.aac"
             subprocess.run([
                 "ffmpeg", "-y", "-i", audio_path,
                 "-ar", AUDIO_SR, "-ac", AUDIO_CHANNELS, "-b:a", AUDIO_BITRATE,
                 "-c:a", "aac", "-strict", "-2",
                 norm_audio
-            ], check=True, timeout=120)
+            ], check=True, timeout=60)
 
-            # Merge
-            output_path = f"{TEMP_DIR}/clip_{i}.mp4"
+            output_path = f"{job_temp}/clip_{i}.mp4"
             subprocess.run([
                 "ffmpeg", "-y", "-i", norm_video, "-i", norm_audio,
                 "-c:v", "libx264", "-c:a", "aac", "-preset", "ultrafast",
@@ -135,116 +119,150 @@ def render_video():
             ], check=True, timeout=120)
 
             clips.append(output_path)
-            print(f"[TIME] Scene {i} processed in {time.time() - start_time} sec")
-
-        # Bg music
-        head = requests.head(bg_music)
-        print(f"[DEBUG] BG music head status: {head.status_code}")
-        if head.status_code != 200:
-            raise Exception(f"Background music URL not accessible: {bg_music}")
+            print(f"[{job_id}] Scene {i} done in {time.time() - start_time:.1f}s")
 
         # 2️⃣ Concat
-        concat_file = f"{TEMP_DIR}/concat.txt"
+        concat_file = f"{job_temp}/concat.txt"
         with open(concat_file, "w") as f:
             for c in clips:
                 f.write(f"file '{os.path.abspath(c)}'\n")
 
-        merged_path = f"{TEMP_DIR}/merged.mp4"
-
+        merged_path = f"{job_temp}/merged.mp4"
         subprocess.run([
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
             "-i", concat_file,
             "-c:v", "libx264", "-c:a", "aac", "-preset", "ultrafast",
             merged_path
-        ], check=True, timeout=600)  # Longer for concat
-        print(f"[TIME] Concat done in {time.time() - start_time} sec")
+        ], check=True, timeout=900)
+        print(f"[{job_id}] Concat done in {time.time() - start_time:.1f}s")
 
         # 3️⃣ Duration
         result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of",
-             "default=noprint_wrappers=1:nokey=1", merged_path],
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", merged_path],
             stdout=subprocess.PIPE, text=True
         )
         total_duration = float(result.stdout.strip())
-        print(f"[TIME] Duration probe done in {time.time() - start_time} sec")
 
-        # 4️⃣ Extend bg_music
-        bg_extended = f"{TEMP_DIR}/bg_extended.mp3"
+        # 4️⃣ BG music
+        bg_extended = f"{job_temp}/bg_extended.mp3"
         subprocess.run([
-            "ffmpeg", "-y",
-            "-stream_loop", "-1",
-            "-i", bg_music,
+            "ffmpeg", "-y", "-stream_loop", "-1", "-i", bg_music,
             "-t", str(total_duration),
             "-af", f"afade=t=in:ss=0:d=3,afade=t=out:st={total_duration - 3}:d=3",
             bg_extended
         ], check=True, timeout=120)
-        print(f"[TIME] BG music extended in {time.time() - start_time} sec")
 
-        # 5️⃣ Check audio in merged
+        # 5️⃣ Audio mix
         probe = subprocess.run([
-            "ffprobe", "-v", "error",
-            "-select_streams", "a",
-            "-show_entries", "stream=index",
-            "-of", "csv=p=0",
-            merged_path
+            "ffprobe", "-v", "error", "-select_streams", "a",
+            "-show_entries", "stream=index", "-of", "csv=p=0", merged_path
         ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
         has_audio = bool(probe.stdout.strip())
-        print(f"[DEBUG] Has audio in merged: {has_audio}")
 
-        final_path = f"{TEMP_DIR}/final_{uuid.uuid4().hex}.mp4"
+        final_path = f"{job_temp}/final_{job_id}.mp4"
 
         if has_audio:
             subprocess.run([
                 "ffmpeg", "-y",
-                "-i", merged_path,
-                "-i", bg_extended,
+                "-i", merged_path, "-i", bg_extended,
                 "-filter_complex", "[0:a]volume=1.0[a0];[1:a]volume=0.1[a1];[a0][a1]amix=inputs=2:duration=longest",
-                "-c:v", "copy",
-                "-shortest", final_path
-            ], check=True, timeout=300)
+                "-c:v", "copy", "-shortest", final_path
+            ], check=True, timeout=600)
         else:
-            print("[WARNING] No audio in merged — adding bg only")
             subprocess.run([
                 "ffmpeg", "-y",
-                "-i", merged_path,
-                "-i", bg_extended,
-                "-map", "0:v:0",
-                "-map", "1:a:0",
-                "-c:v", "copy",
-                "-c:a", "aac",
-                "-shortest",
+                "-i", merged_path, "-i", bg_extended,
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "copy", "-c:a", "aac", "-shortest",
                 final_path
-            ], check=True, timeout=300)
-        print(f"[TIME] Audio mix done in {time.time() - start_time} sec")
+            ], check=True, timeout=600)
 
-        # 6️⃣ Upload
+        # 6️⃣ Upload to R2
         s3 = boto3.client(
             's3',
             endpoint_url=R2_ENDPOINT,
             aws_access_key_id=R2_ACCESS_KEY,
             aws_secret_access_key=R2_SECRET_KEY,
         )
-
-        key = f"videos/{os.path.basename(final_path)}"
+        key = f"videos/final_{job_id}.mp4"
         s3.upload_file(final_path, R2_BUCKET, key)
-        url = f"{R2_PUBLIC_URL}/{key}"
-        print(f"[TIME] Upload done in {time.time() - start_time} sec")
+        video_url = f"{R2_PUBLIC_URL}/{key}"
+        total_time = time.time() - start_time
+        print(f"[{job_id}] DONE in {total_time:.1f}s → {video_url}")
 
-        # 7️⃣ Cleanup
-        for f in os.listdir(TEMP_DIR):
-            try:
-                os.remove(os.path.join(TEMP_DIR, f))
-            except:
-                pass
-
-        print(f"[END] Total time: {time.time() - start_time} sec")
-        return jsonify({"status": "success", "url": url})
+        # 7️⃣ Callback to Make.com
+        requests.post(callback_url, json={
+            "status": "success",
+            "job_id": job_id,
+            "url": video_url,
+            "render_time_sec": round(total_time, 1)
+        }, timeout=30)
 
     except Exception as e:
-        print(f"[ERROR] Exception: {str(e)}")
+        print(f"[{job_id}] ERROR: {e}")
+        traceback.print_exc()
+        try:
+            requests.post(callback_url, json={
+                "status": "error",
+                "job_id": job_id,
+                "message": str(e)
+            }, timeout=30)
+        except:
+            pass
+
+    finally:
+        # Cleanup
+        import shutil
+        try:
+            shutil.rmtree(job_temp)
+        except:
+            pass
+
+
+@app.route('/render', methods=['POST'])
+def render_video():
+    """
+    Accepts render job, starts background thread, immediately returns job_id.
+    Make.com should listen on a webhook to receive the result.
+    """
+    try:
+        data = request.get_json()
+        input_data = data.get("input", {})
+        # ⚠️ Make.com webhook URL must be passed in the request
+        callback_url = data.get("callback_url")
+
+        if not input_data:
+            return jsonify({"status": "error", "message": "No 'input' data"}), 400
+        if not callback_url:
+            return jsonify({"status": "error", "message": "No 'callback_url' provided"}), 400
+
+        job_id = uuid.uuid4().hex
+        print(f"[NEW JOB] {job_id}, scenes: {len(input_data.get('scenes', []))}")
+
+        # Start background thread — Make.com gets instant response
+        thread = threading.Thread(
+            target=render_in_background,
+            args=(job_id, input_data, callback_url),
+            daemon=True
+        )
+        thread.start()
+
+        return jsonify({
+            "status": "processing",
+            "job_id": job_id,
+            "message": "Render started. Result will be sent to callback_url."
+        })
+
+    except Exception as e:
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "ok"})
+
+
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, host='0.0.0.0', port=5000)
