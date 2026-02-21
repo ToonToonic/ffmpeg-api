@@ -80,11 +80,9 @@ def render_in_background(job_id, input_data, callback_url):
         # 1️⃣ Scenes
         for i, scene in enumerate(scenes):
             video_url = scene.get("video_url")
-            audio_url = scene.get("audio_url")
-
+           
             video_path = f"{job_temp}/video_{i}.mp4"
-            audio_path = f"{job_temp}/audio_{i}.wav"
-
+           
             r = requests.get(video_url, timeout=60)
             r.raise_for_status()
             with open(video_path, 'wb') as f:
