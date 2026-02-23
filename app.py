@@ -7,6 +7,7 @@ import requests
 import traceback
 import time
 import threading
+import shutil
 
 app = Flask(__name__)
 
@@ -21,14 +22,16 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 
 VIDEO_RES = "1280:720"
 FPS = "30"
-AUDIO_SR = "44100"
-AUDIO_CHANNELS = "2"
-AUDIO_BITRATE = "128k"
 VIDEO_BITRATE = "1500k"
 
-
-def render_in_background(job_id, input_data, callback_url):
-    """Runs FFmpeg render in background thread, then POSTs result to Make webhook."""
+# ─────────────────────────────────────────────
+# BACKGROUND RENDER (runs in separate thread)
+# ─────────────────────────────────────────────
+def render_in_background(job_id, input_data, callback_url, metadata):
+    """
+    Grok generates video WITH audio — no separate audio processing needed.
+    Pipeline: download scenes → normalize video (keep audio) → concat → upload → callback
+    """
     start_time = time.time()
     job_temp = f"{TEMP_DIR}/{job_id}"
     os.makedirs(job_temp, exist_ok=True)
@@ -36,16 +39,13 @@ def render_in_background(job_id, input_data, callback_url):
     try:
         video_cover = input_data.get("video_cover")
         scenes = input_data.get("scenes", [])
-        bg_music = input_data.get("background_music_url")
 
         if not scenes:
             raise Exception("No scenes provided")
-        if not bg_music:
-            raise Exception("No background_music_url provided")
 
         clips = []
 
-        # 0️⃣ Cover
+        # ─── 0. Cover (optional) ───────────────────────────────────────────
         if video_cover:
             cover_path = f"{job_temp}/cover_original"
             r = requests.get(video_cover, timeout=60)
@@ -54,129 +54,88 @@ def render_in_background(job_id, input_data, callback_url):
                 f.write(r.content)
 
             norm_cover = f"{job_temp}/cover.mp4"
+
+            # Check if cover is image or video
             probe = subprocess.run(
                 ["ffprobe", "-v", "error", "-show_format", cover_path],
                 stdout=subprocess.PIPE, text=True
             )
-            if "png" in probe.stdout or "jpg" in probe.stdout:
+            is_image = "png" in probe.stdout or "jpg" in probe.stdout or "jpeg" in probe.stdout
+
+            if is_image:
+                # Image → 3 sec silent video
                 subprocess.run([
                     "ffmpeg", "-y", "-loop", "1", "-i", cover_path,
                     "-t", "3",
-                    "-vf", f"scale={VIDEO_RES}:force_original_aspect_ratio=decrease,pad={VIDEO_RES}:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p",
+                    "-vf", f"scale={VIDEO_RES}:force_original_aspect_ratio=decrease,"
+                           f"pad={VIDEO_RES}:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p",
                     "-c:v", "libx264", "-b:v", VIDEO_BITRATE, "-preset", "ultrafast",
+                    "-an", # no audio for cover image
                     norm_cover
                 ], check=True, timeout=120)
             else:
+                # Video → normalize resolution, KEEP original audio from cover
                 subprocess.run([
                     "ffmpeg", "-y", "-i", cover_path,
-                    "-vf", f"scale={VIDEO_RES}:force_original_aspect_ratio=decrease,pad={VIDEO_RES}:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p",
+                    "-vf", f"scale={VIDEO_RES}:force_original_aspect_ratio=decrease,"
+                           f"pad={VIDEO_RES}:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p",
                     "-c:v", "libx264", "-b:v", VIDEO_BITRATE, "-preset", "ultrafast",
+                    "-c:a", "aac", "-b:a", "128k", # keep audio
                     norm_cover
                 ], check=True, timeout=120)
 
             clips.append(norm_cover)
             print(f"[{job_id}] Cover done in {time.time() - start_time:.1f}s")
 
-        # 1️⃣ Scenes
+        # ─── 1. Scenes ─────────────────────────────────────────────────────
+        # Grok video already contains audio — just normalize video resolution
         for i, scene in enumerate(scenes):
             video_url = scene.get("video_url")
-           
+
+            if not video_url:
+                raise Exception(f"Missing video_url in scene {i}")
+
             video_path = f"{job_temp}/video_{i}.mp4"
-           
-            r = requests.get(video_url, timeout=60)
+            r = requests.get(video_url, timeout=120)
             r.raise_for_status()
             with open(video_path, 'wb') as f:
                 f.write(r.content)
 
-            r = requests.get(audio_url, timeout=60)
-            r.raise_for_status()
-            with open(audio_path, 'wb') as f:
-                f.write(r.content)
-
-            norm_video = f"{job_temp}/norm_video_{i}.mp4"
+            # Normalize resolution + FPS, KEEP original Grok audio (dialogues + music)
+            norm_video = f"{job_temp}/norm_{i}.mp4"
             subprocess.run([
                 "ffmpeg", "-y", "-i", video_path,
-                "-vf", f"scale={VIDEO_RES}:force_original_aspect_ratio=decrease,pad={VIDEO_RES}:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p",
+                "-vf", f"scale={VIDEO_RES}:force_original_aspect_ratio=decrease,"
+                       f"pad={VIDEO_RES}:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p",
                 "-c:v", "libx264", "-b:v", VIDEO_BITRATE, "-preset", "ultrafast",
+                "-c:a", "aac", "-b:a", "128k", # preserve Grok audio
                 norm_video
-            ], check=True, timeout=120)
+            ], check=True, timeout=180)
 
-            norm_audio = f"{job_temp}/norm_audio_{i}.aac"
-            subprocess.run([
-                "ffmpeg", "-y", "-i", audio_path,
-                "-ar", AUDIO_SR, "-ac", AUDIO_CHANNELS, "-b:a", AUDIO_BITRATE,
-                "-c:a", "aac", "-strict", "-2",
-                norm_audio
-            ], check=True, timeout=60)
-
-            output_path = f"{job_temp}/clip_{i}.mp4"
-            subprocess.run([
-                "ffmpeg", "-y", "-i", norm_video, "-i", norm_audio,
-                "-c:v", "libx264", "-c:a", "aac", "-preset", "ultrafast",
-                output_path
-            ], check=True, timeout=120)
-
-            clips.append(output_path)
+            clips.append(norm_video)
             print(f"[{job_id}] Scene {i} done in {time.time() - start_time:.1f}s")
 
-        # 2️⃣ Concat
+        # ─── 2. Concat all clips ───────────────────────────────────────────
         concat_file = f"{job_temp}/concat.txt"
         with open(concat_file, "w") as f:
             for c in clips:
                 f.write(f"file '{os.path.abspath(c)}'\n")
 
-        merged_path = f"{job_temp}/merged.mp4"
-        subprocess.run([
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", concat_file,
-            "-c:v", "libx264", "-c:a", "aac", "-preset", "ultrafast",
-            merged_path
-        ], check=True, timeout=900)
-        print(f"[{job_id}] Concat done in {time.time() - start_time:.1f}s")
-
-        # 3️⃣ Duration
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", merged_path],
-            stdout=subprocess.PIPE, text=True
-        )
-        total_duration = float(result.stdout.strip())
-
-        # 4️⃣ BG music
-        bg_extended = f"{job_temp}/bg_extended.mp3"
-        subprocess.run([
-            "ffmpeg", "-y", "-stream_loop", "-1", "-i", bg_music,
-            "-t", str(total_duration),
-            "-af", f"afade=t=in:ss=0:d=3,afade=t=out:st={total_duration - 3}:d=3",
-            bg_extended
-        ], check=True, timeout=120)
-
-        # 5️⃣ Audio mix
-        probe = subprocess.run([
-            "ffprobe", "-v", "error", "-select_streams", "a",
-            "-show_entries", "stream=index", "-of", "csv=p=0", merged_path
-        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        has_audio = bool(probe.stdout.strip())
-
         final_path = f"{job_temp}/final_{job_id}.mp4"
 
-        if has_audio:
-            subprocess.run([
-                "ffmpeg", "-y",
-                "-i", merged_path, "-i", bg_extended,
-                "-filter_complex", "[0:a]volume=1.0[a0];[1:a]volume=0.1[a1];[a0][a1]amix=inputs=2:duration=longest",
-                "-c:v", "copy", "-shortest", final_path
-            ], check=True, timeout=600)
-        else:
-            subprocess.run([
-                "ffmpeg", "-y",
-                "-i", merged_path, "-i", bg_extended,
-                "-map", "0:v:0", "-map", "1:a:0",
-                "-c:v", "copy", "-c:a", "aac", "-shortest",
-                final_path
-            ], check=True, timeout=600)
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", concat_file,
+            "-c:v", "libx264", "-preset", "ultrafast", # re-encode video for compatibility
+            "-c:a", "aac", "-b:a", "128k", # keep audio from all scenes
+            final_path
+        ], check=True, timeout=900)
 
-        # 6️⃣ Upload to R2
+        total_time = time.time() - start_time
+        print(f"[{job_id}] Concat done in {total_time:.1f}s")
+
+        # ─── 3. Upload to Cloudflare R2 ────────────────────────────────────
         s3 = boto3.client(
             's3',
             endpoint_url=R2_ENDPOINT,
@@ -185,16 +144,19 @@ def render_in_background(job_id, input_data, callback_url):
         )
         key = f"videos/final_{job_id}.mp4"
         s3.upload_file(final_path, R2_BUCKET, key)
-        video_url = f"{R2_PUBLIC_URL}/{key}"
-        total_time = time.time() - start_time
-        print(f"[{job_id}] DONE in {total_time:.1f}s → {video_url}")
+        video_url_result = f"{R2_PUBLIC_URL}/{key}"
 
-        # 7️⃣ Callback to Make.com
+        total_time = time.time() - start_time
+        print(f"[{job_id}] DONE in {total_time:.1f}s → {video_url_result}")
+
+        # ─── 4. Callback to Make.com Scenario 2 ───────────────────────────
+        # metadata (email, name, etc.) is passed back so Scenario 2 can send email
         requests.post(callback_url, json={
             "status": "success",
             "job_id": job_id,
-            "url": video_url,
-            "render_time_sec": round(total_time, 1)
+            "url": video_url_result,
+            "render_time_sec": round(total_time, 1),
+            "metadata": metadata # ← user email, name, child_name, order_id
         }, timeout=30)
 
     except Exception as e:
@@ -204,31 +166,55 @@ def render_in_background(job_id, input_data, callback_url):
             requests.post(callback_url, json={
                 "status": "error",
                 "job_id": job_id,
-                "message": str(e)
+                "message": str(e),
+                "metadata": metadata # send metadata even on error
             }, timeout=30)
         except:
             pass
 
     finally:
-        # Cleanup
-        import shutil
         try:
             shutil.rmtree(job_temp)
         except:
             pass
 
 
+# ─────────────────────────────────────────────
+# ROUTES
+# ─────────────────────────────────────────────
 @app.route('/render', methods=['POST'])
 def render_video():
     """
-    Accepts render job, starts background thread, immediately returns job_id.
-    Make.com should listen on a webhook to receive the result.
+    Accepts render job from Make.com Scenario 1.
+    Immediately returns job_id (no timeout).
+    Result is POSTed to callback_url when ready.
+
+    Expected JSON:
+    {
+        "input": {
+            "video_cover": "https://...", (optional)
+            "scenes": [
+                {"video_url": "https://..."}, // Grok video WITH audio
+                ...
+            ]
+        },
+        "callback_url": "https://hook.make.com/...",
+        "metadata": {
+            "user_email": "anna@gmail.com",
+            "user_name": "Anna",
+            "child_name": "Saly",
+            "order_id": "12345"
+        }
+    }
     """
     try:
         data = request.get_json()
+        if not data:
+            return jsonify({"status": "error", "message": "Invalid JSON"}), 400
+
         input_data = data.get("input", {})
-        # ⚠️ Make.com webhook URL must be passed in the request
         callback_url = data.get("callback_url")
+        metadata = data.get("metadata", {}) # ← user data from Scenario 1
 
         if not input_data:
             return jsonify({"status": "error", "message": "No 'input' data"}), 400
@@ -236,12 +222,13 @@ def render_video():
             return jsonify({"status": "error", "message": "No 'callback_url' provided"}), 400
 
         job_id = uuid.uuid4().hex
-        print(f"[NEW JOB] {job_id}, scenes: {len(input_data.get('scenes', []))}")
+        scenes_count = len(input_data.get('scenes', []))
+        print(f"[NEW JOB] {job_id}, scenes: {scenes_count}, user: {metadata.get('user_email', 'unknown')}")
 
-        # Start background thread — Make.com gets instant response
+        # Start background thread — Make.com gets instant response (<1 sec)
         thread = threading.Thread(
             target=render_in_background,
-            args=(job_id, input_data, callback_url),
+            args=(job_id, input_data, callback_url, metadata),
             daemon=True
         )
         thread.start()
@@ -249,7 +236,7 @@ def render_video():
         return jsonify({
             "status": "processing",
             "job_id": job_id,
-            "message": "Render started. Result will be sent to callback_url."
+            "message": f"Render started for {scenes_count} scenes. Result will be sent to callback_url."
         })
 
     except Exception as e:
@@ -259,7 +246,7 @@ def render_video():
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "service": "toontoonic-render"})
 
 
 if __name__ == '__main__':
