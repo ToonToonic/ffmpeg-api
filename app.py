@@ -24,13 +24,164 @@ VIDEO_RES = "1280:720"
 FPS = "30"
 VIDEO_BITRATE = "1500k"
 
-# ─────────────────────────────────────────────
-# BACKGROUND RENDER (runs in separate thread)
-# ─────────────────────────────────────────────
+# ─── Transition settings ───────────────────────────────────────────────────────
+TRANSITION_TYPE     = "fadewhite"   # fadewhite / fadeblack / dissolve / smoothleft
+TRANSITION_DURATION = 1.0           # seconds
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_video_duration(path):
+    """Return duration of a video file in seconds (float)."""
+    result = subprocess.run([
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return float(result.stdout.strip())
+
+
+def has_audio_stream(path):
+    """Return True if video file contains at least one audio stream."""
+    result = subprocess.run([
+        "ffprobe", "-v", "error",
+        "-select_streams", "a",
+        "-show_entries", "stream=index",
+        "-of", "csv=p=0",
+        path
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return bool(result.stdout.strip())
+
+
+def normalize_clip(input_path, output_path, job_id, label, job_temp, duration_sec=None):
+    """
+    Normalize video to uniform resolution/fps/codec.
+    Keeps original audio if present; adds silent audio track if missing
+    (so all clips have audio stream — required for xfade audio mixing).
+    duration_sec: if set, trims clip to this length (used for image covers).
+    """
+    vf = (
+        f"scale={VIDEO_RES}:force_original_aspect_ratio=decrease,"
+        f"pad={VIDEO_RES}:(ow-iw)/2:(oh-ih)/2,"
+        f"fps={FPS},"
+        f"format=yuv420p"
+    )
+
+    has_audio = has_audio_stream(input_path)
+
+    cmd = ["ffmpeg", "-y"]
+
+    # For image: use -loop 1 to create video from still image
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_format", input_path],
+        stdout=subprocess.PIPE, text=True
+    )
+    is_image = any(fmt in probe.stdout for fmt in ("png", "jpg", "jpeg", "gif", "webp"))
+
+    if is_image:
+        cmd += ["-loop", "1", "-i", input_path, "-t", str(duration_sec or 5)]
+        cmd += ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"]
+        cmd += [
+            "-vf", vf,
+            "-c:v", "libx264", "-b:v", VIDEO_BITRATE, "-preset", "ultrafast",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+            "-map", "0:v", "-map", "1:a",
+            "-shortest", output_path
+        ]
+    elif not has_audio:
+        # Video without audio — add silent track
+        cmd += ["-i", input_path, "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"]
+        cmd += [
+            "-vf", vf,
+            "-c:v", "libx264", "-b:v", VIDEO_BITRATE, "-preset", "ultrafast",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+            "-map", "0:v", "-map", "1:a",
+            "-shortest", output_path
+        ]
+    else:
+        # Normal video with audio
+        cmd += ["-i", input_path]
+        if duration_sec:
+            cmd += ["-t", str(duration_sec)]
+        cmd += [
+            "-vf", vf,
+            "-c:v", "libx264", "-b:v", VIDEO_BITRATE, "-preset", "ultrafast",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+            output_path
+        ]
+
+    subprocess.run(cmd, check=True, timeout=180)
+    print(f"[{job_id}] {label} normalized → {os.path.basename(output_path)}")
+
+
+def build_xfade_filter(clips_with_durations, td):
+    """
+    Build FFmpeg filter_complex string for chained xfade (video) + acrossfade (audio).
+
+    clips_with_durations : list of (path, duration_float)
+    td                   : transition duration in seconds
+
+    Returns: (filter_complex_str, final_video_label, final_audio_label)
+    """
+    n = len(clips_with_durations)
+
+    if n == 1:
+        return None, "[0:v]", "[0:a]"
+
+    video_parts = []
+    audio_parts = []
+
+    # ── VIDEO xfade chain ──────────────────────────────────────────────────
+    # offset = cumulative duration of previous clips minus accumulated transitions
+    video_prev = "[0:v]"
+    offset = 0.0
+
+    for i in range(1, n):
+        prev_dur = clips_with_durations[i - 1][1]
+        offset += prev_dur - td
+        offset = round(offset, 4)
+
+        out_label = f"[vx{i}]"
+        video_parts.append(
+            f"{video_prev}[{i}:v]xfade="
+            f"transition={TRANSITION_TYPE}:"
+            f"duration={td}:"
+            f"offset={offset}"
+            f"{out_label}"
+        )
+        video_prev = out_label
+
+    # ── AUDIO acrossfade chain ─────────────────────────────────────────────
+    audio_prev = "[0:a]"
+
+    for i in range(1, n):
+        out_label = f"[ax{i}]"
+        audio_parts.append(
+            f"{audio_prev}[{i}:a]acrossfade="
+            f"d={td}:"
+            f"c1=tri:c2=tri"   # triangular — smooth natural fade
+            f"{out_label}"
+        )
+        audio_prev = out_label
+
+    filter_complex = ";".join(video_parts + audio_parts)
+    return filter_complex, video_prev, audio_prev
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BACKGROUND RENDER
+# ─────────────────────────────────────────────────────────────────────────────
+
 def render_in_background(job_id, input_data, callback_url, metadata):
     """
-    Grok generates video WITH audio — no separate audio processing needed.
-    Pipeline: download scenes → normalize video (keep audio) → concat → upload → callback
+    Pipeline:
+      1. Download & normalize all clips (cover + scenes)
+      2. Apply xfade (video) + acrossfade (audio) transitions
+      3. Upload final video to Cloudflare R2
+      4. POST result + metadata to Make.com callback_url (Scenario 2)
     """
     start_time = time.time()
     job_temp = f"{TEMP_DIR}/{job_id}"
@@ -38,106 +189,83 @@ def render_in_background(job_id, input_data, callback_url, metadata):
 
     try:
         video_cover = input_data.get("video_cover")
-        scenes = input_data.get("scenes", [])
+        scenes      = input_data.get("scenes", [])
 
         if not scenes:
             raise Exception("No scenes provided")
 
-        clips = []
+        norm_clips = []  # normalized file paths in order
 
-        # ─── 0. Cover (optional) ───────────────────────────────────────────
+        # ── 0. Cover ──────────────────────────────────────────────────────
         if video_cover:
-            cover_path = f"{job_temp}/cover_original"
+            cover_raw  = f"{job_temp}/cover_raw"
+            cover_norm = f"{job_temp}/cover_norm.mp4"
+
             r = requests.get(video_cover, timeout=60)
             r.raise_for_status()
-            with open(cover_path, 'wb') as f:
+            with open(cover_raw, "wb") as f:
                 f.write(r.content)
 
-            norm_cover = f"{job_temp}/cover.mp4"
-
-            # Check if cover is image or video
-            probe = subprocess.run(
-                ["ffprobe", "-v", "error", "-show_format", cover_path],
-                stdout=subprocess.PIPE, text=True
-            )
-            is_image = "png" in probe.stdout or "jpg" in probe.stdout or "jpeg" in probe.stdout
-
-            if is_image:
-                # Image → 3 sec silent video
-                subprocess.run([
-                    "ffmpeg", "-y", "-loop", "1", "-i", cover_path,
-                    "-t", "3",
-                    "-vf", f"scale={VIDEO_RES}:force_original_aspect_ratio=decrease,"
-                           f"pad={VIDEO_RES}:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p",
-                    "-c:v", "libx264", "-b:v", VIDEO_BITRATE, "-preset", "ultrafast",
-                    "-an", # no audio for cover image
-                    norm_cover
-                ], check=True, timeout=120)
-            else:
-                # Video → normalize resolution, KEEP original audio from cover
-                subprocess.run([
-                    "ffmpeg", "-y", "-i", cover_path,
-                    "-vf", f"scale={VIDEO_RES}:force_original_aspect_ratio=decrease,"
-                           f"pad={VIDEO_RES}:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p",
-                    "-c:v", "libx264", "-b:v", VIDEO_BITRATE, "-preset", "ultrafast",
-                    "-c:a", "aac", "-b:a", "128k", # keep audio
-                    norm_cover
-                ], check=True, timeout=120)
-
-            clips.append(norm_cover)
+            normalize_clip(cover_raw, cover_norm, job_id, "Cover", job_temp, duration_sec=5)
+            norm_clips.append(cover_norm)
             print(f"[{job_id}] Cover done in {time.time() - start_time:.1f}s")
 
-        # ─── 1. Scenes ─────────────────────────────────────────────────────
-        # Grok video already contains audio — just normalize video resolution
+        # ── 1. Scenes ──────────────────────────────────────────────────────
         for i, scene in enumerate(scenes):
             video_url = scene.get("video_url")
-
             if not video_url:
                 raise Exception(f"Missing video_url in scene {i}")
 
-            video_path = f"{job_temp}/video_{i}.mp4"
+            raw_path  = f"{job_temp}/scene_{i}_raw.mp4"
+            norm_path = f"{job_temp}/scene_{i}_norm.mp4"
+
             r = requests.get(video_url, timeout=120)
             r.raise_for_status()
-            with open(video_path, 'wb') as f:
+            with open(raw_path, "wb") as f:
                 f.write(r.content)
 
-            # Normalize resolution + FPS, KEEP original Grok audio (dialogues + music)
-            norm_video = f"{job_temp}/norm_{i}.mp4"
-            subprocess.run([
-                "ffmpeg", "-y", "-i", video_path,
-                "-vf", f"scale={VIDEO_RES}:force_original_aspect_ratio=decrease,"
-                       f"pad={VIDEO_RES}:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p",
-                "-c:v", "libx264", "-b:v", VIDEO_BITRATE, "-preset", "ultrafast",
-                "-c:a", "aac", "-b:a", "128k", # preserve Grok audio
-                norm_video
-            ], check=True, timeout=180)
-
-            clips.append(norm_video)
+            normalize_clip(raw_path, norm_path, job_id, f"Scene {i}", job_temp)
+            norm_clips.append(norm_path)
             print(f"[{job_id}] Scene {i} done in {time.time() - start_time:.1f}s")
 
-        # ─── 2. Concat all clips ───────────────────────────────────────────
-        concat_file = f"{job_temp}/concat.txt"
-        with open(concat_file, "w") as f:
-            for c in clips:
-                f.write(f"file '{os.path.abspath(c)}'\n")
+        # ── 2. Get durations for xfade offset calculation ──────────────────
+        clips_with_durations = []
+        for path in norm_clips:
+            dur = get_video_duration(path)
+            clips_with_durations.append((path, dur))
+            print(f"[{job_id}]   {os.path.basename(path)}: {dur:.2f}s")
 
+        # ── 3. Merge with xfade transitions ────────────────────────────────
         final_path = f"{job_temp}/final_{job_id}.mp4"
+        td = TRANSITION_DURATION
 
-        subprocess.run([
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0",
-            "-i", concat_file,
-            "-c:v", "libx264", "-preset", "ultrafast", # re-encode video for compatibility
-            "-c:a", "aac", "-b:a", "128k", # keep audio from all scenes
-            final_path
-        ], check=True, timeout=900)
+        if len(norm_clips) == 1:
+            shutil.copy(norm_clips[0], final_path)
+            print(f"[{job_id}] Single clip — no transitions needed")
+        else:
+            filter_complex, v_out, a_out = build_xfade_filter(clips_with_durations, td)
 
-        total_time = time.time() - start_time
-        print(f"[{job_id}] Concat done in {total_time:.1f}s")
+            inputs = []
+            for path, _ in clips_with_durations:
+                inputs += ["-i", path]
 
-        # ─── 3. Upload to Cloudflare R2 ────────────────────────────────────
+            cmd = ["ffmpeg", "-y"] + inputs + [
+                "-filter_complex", filter_complex,
+                "-map", v_out,
+                "-map", a_out,
+                "-c:v", "libx264", "-b:v", VIDEO_BITRATE, "-preset", "ultrafast",
+                "-c:a", "aac", "-b:a", "128k",
+                final_path
+            ]
+
+            print(f"[{job_id}] Merging {len(norm_clips)} clips with {TRANSITION_TYPE} transitions...")
+            subprocess.run(cmd, check=True, timeout=1200)
+
+        print(f"[{job_id}] Merge done in {time.time() - start_time:.1f}s")
+
+        # ── 4. Upload to Cloudflare R2 ─────────────────────────────────────
         s3 = boto3.client(
-            's3',
+            "s3",
             endpoint_url=R2_ENDPOINT,
             aws_access_key_id=R2_ACCESS_KEY,
             aws_secret_access_key=R2_SECRET_KEY,
@@ -149,14 +277,13 @@ def render_in_background(job_id, input_data, callback_url, metadata):
         total_time = time.time() - start_time
         print(f"[{job_id}] DONE in {total_time:.1f}s → {video_url_result}")
 
-        # ─── 4. Callback to Make.com Scenario 2 ───────────────────────────
-        # metadata (email, name, etc.) is passed back so Scenario 2 can send email
+        # ── 5. Callback to Make.com Scenario 2 ────────────────────────────
         requests.post(callback_url, json={
-            "status": "success",
-            "job_id": job_id,
-            "url": video_url_result,
+            "status":          "success",
+            "job_id":          job_id,
+            "url":             video_url_result,
             "render_time_sec": round(total_time, 1),
-            "metadata": metadata # ← user email, name, child_name, order_id
+            "metadata":        metadata   # user_email, user_name, child_name, order_id
         }, timeout=30)
 
     except Exception as e:
@@ -164,10 +291,10 @@ def render_in_background(job_id, input_data, callback_url, metadata):
         traceback.print_exc()
         try:
             requests.post(callback_url, json={
-                "status": "error",
-                "job_id": job_id,
-                "message": str(e),
-                "metadata": metadata # send metadata even on error
+                "status":   "error",
+                "job_id":   job_id,
+                "message":  str(e),
+                "metadata": metadata
             }, timeout=30)
         except:
             pass
@@ -179,31 +306,33 @@ def render_in_background(job_id, input_data, callback_url, metadata):
             pass
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # ROUTES
-# ─────────────────────────────────────────────
-@app.route('/render', methods=['POST'])
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route("/render", methods=["POST"])
 def render_video():
     """
+    POST /render
     Accepts render job from Make.com Scenario 1.
-    Immediately returns job_id (no timeout).
-    Result is POSTed to callback_url when ready.
+    Returns job_id immediately (<1 sec) — no timeout risk.
+    Final video URL + metadata POSTed to callback_url when ready.
 
     Expected JSON:
     {
         "input": {
-            "video_cover": "https://...", (optional)
+            "video_cover": "https://...",       ← optional
             "scenes": [
-                {"video_url": "https://..."}, // Grok video WITH audio
+                {"video_url": "https://..."},   ← Grok video WITH audio
                 ...
             ]
         },
         "callback_url": "https://hook.make.com/...",
         "metadata": {
-            "user_email": "anna@gmail.com",
-            "user_name": "Anna",
-            "child_name": "Saly",
-            "order_id": "12345"
+            "user_email":  "anna@gmail.com",
+            "user_name":   "Anna",
+            "child_name":  "Saly",
+            "order_id":    "12345"
         }
     }
     """
@@ -212,20 +341,21 @@ def render_video():
         if not data:
             return jsonify({"status": "error", "message": "Invalid JSON"}), 400
 
-        input_data = data.get("input", {})
+        input_data   = data.get("input", {})
         callback_url = data.get("callback_url")
-        metadata = data.get("metadata", {}) # ← user data from Scenario 1
+        metadata     = data.get("metadata", {})
 
         if not input_data:
             return jsonify({"status": "error", "message": "No 'input' data"}), 400
         if not callback_url:
             return jsonify({"status": "error", "message": "No 'callback_url' provided"}), 400
 
-        job_id = uuid.uuid4().hex
-        scenes_count = len(input_data.get('scenes', []))
-        print(f"[NEW JOB] {job_id}, scenes: {scenes_count}, user: {metadata.get('user_email', 'unknown')}")
+        job_id       = uuid.uuid4().hex
+        scenes_count = len(input_data.get("scenes", []))
 
-        # Start background thread — Make.com gets instant response (<1 sec)
+        print(f"[NEW JOB] {job_id} | scenes: {scenes_count} | user: {metadata.get('user_email', '?')}")
+        print(f"[NEW JOB] transition: {TRANSITION_TYPE} {TRANSITION_DURATION}s (audio: acrossfade tri)")
+
         thread = threading.Thread(
             target=render_in_background,
             args=(job_id, input_data, callback_url, metadata),
@@ -234,9 +364,12 @@ def render_video():
         thread.start()
 
         return jsonify({
-            "status": "processing",
-            "job_id": job_id,
-            "message": f"Render started for {scenes_count} scenes. Result will be sent to callback_url."
+            "status":  "processing",
+            "job_id":  job_id,
+            "message": (
+                f"Render started: {scenes_count} scenes | "
+                f"transition={TRANSITION_TYPE} {TRANSITION_DURATION}s"
+            )
         })
 
     except Exception as e:
@@ -244,10 +377,15 @@ def render_video():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-@app.route('/health', methods=['GET'])
+@app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "toontoonic-render"})
+    return jsonify({
+        "status":            "ok",
+        "service":           "toontoonic-render",
+        "transition_video":  f"{TRANSITION_TYPE} {TRANSITION_DURATION}s",
+        "transition_audio":  f"acrossfade tri {TRANSITION_DURATION}s"
+    })
 
 
-if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=5000)
